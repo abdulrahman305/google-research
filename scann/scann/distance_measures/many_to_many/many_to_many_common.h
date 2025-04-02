@@ -19,6 +19,7 @@
 #include <atomic>
 
 #include "absl/base/internal/spinlock.h"
+#include "absl/base/prefetch.h"
 #include "absl/synchronization/mutex.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
@@ -26,9 +27,9 @@
 #include "scann/oss_wrappers/scann_threadpool.h"
 #include "scann/utils/common.h"
 #include "scann/utils/fast_top_neighbors.h"
+#include "scann/utils/intrinsics/highway.h"
 #include "scann/utils/intrinsics/simd.h"
 #include "scann/utils/types.h"
-#include "tensorflow/core/platform/prefetch.h"
 
 namespace research_scann {
 
@@ -92,6 +93,17 @@ class EpsilonFilteringCallback {
 
 #endif
 
+  SCANN_INLINE void InvokeOptimized(Highway<float, 2> simd_dists,
+                                    size_t first_dp_idx, size_t query_idx) {
+    float best_dist = epsilons_[query_idx].load(std::memory_order_relaxed);
+
+    auto cmp = (simd_dists < Highway<float>::Broadcast(best_dist));
+    if (ABSL_PREDICT_TRUE((cmp[0] | cmp[1]).MaskFromHighBits() == 0)) return;
+
+    auto dists = simd_dists.Store();
+    slow_path_fn_(MakeMutableSpan(dists), first_dp_idx, query_idx);
+  }
+
   SCANN_INLINE void operator()(MutableSpan<FloatT> block, size_t first_dp_idx,
                                size_t query_idx) {
     Invoke(block, first_dp_idx, query_idx);
@@ -142,9 +154,8 @@ class ManyToManyTop1Callback {
     auto& top1 = top1_result_by_query_[query_idx];
     const size_t mutex_idx = query_idx & (kNumSpinLocks - 1);
     auto mutex_ptr = &(*mutexes_)[mutex_idx];
-    ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(&top1);
-    ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-        mutex_ptr);
+    absl::PrefetchToLocalCache(&top1);
+    absl::PrefetchToLocalCache(mutex_ptr);
 
     FloatT best_dist = block[0];
     DCHECK(!std::isnan(best_dist)) << "NAN at DP idx 0";
@@ -331,6 +342,12 @@ class EpsilonFilteringOffsetWrapper {
 #endif
 
   SCANN_INLINE void InvokeOptimized(fallback::Simd<float, 2> dists,
+                                    size_t first_dp_idx, size_t query_idx) {
+    base_.InvokeOptimized(dists, first_dp_idx + dp_idx_offset_,
+                          query_idx_table_[query_idx]);
+  }
+
+  SCANN_INLINE void InvokeOptimized(Highway<float, 2> dists,
                                     size_t first_dp_idx, size_t query_idx) {
     base_.InvokeOptimized(dists, first_dp_idx + dp_idx_offset_,
                           query_idx_table_[query_idx]);

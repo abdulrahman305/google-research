@@ -26,6 +26,8 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/functional/any_invocable.h"
+#include "absl/strings/str_cat.h"
 #include "scann/proto/input_output.pb.h"
 #include "scann/utils/common.h"
 
@@ -39,10 +41,12 @@ using DatapointIndex = uint64_t;
 using DatapointIndex = uint32_t;
 #endif
 enum : DatapointIndex {
+
   kInvalidDatapointIndex = std::numeric_limits<DatapointIndex>::max(),
 };
 
 enum : size_t {
+
   kMaxNumDatapoints = (kInvalidDatapointIndex >> 1) + 1
 };
 
@@ -62,6 +66,12 @@ inline std::string DimensionIndexToKey(DimensionIndex di) {
 }
 
 using NNResultsVector = std::vector<std::pair<DatapointIndex, float>>;
+
+using DpIdxGetter = absl::AnyInvocable<DatapointIndex(size_t) const>;
+
+using StringSetter = absl::AnyInvocable<void(size_t, string_view) const>;
+
+using OutputStringGetter = absl::AnyInvocable<std::string*(size_t) const>;
 
 class NoValue {
  public:
@@ -460,6 +470,10 @@ constexpr T MaxOrInfinity() {
     return numeric_limits<T>::max();
   }
 }
+
+static constexpr int kNumDatapointsPerBlock = 32;
+static constexpr int kPackedDataSetBlockSizeBits = 4;
+static constexpr int kPackedDatasetBlockSize = 1 << 4;
 
 }  // namespace research_scann
 

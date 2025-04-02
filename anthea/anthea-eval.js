@@ -744,7 +744,7 @@ class AntheaError {
 /**
  * A seeded random number generator based on C++ std::minstd_rand. Note that
  * using seed=0 is a special case that results in always returning 0. Because
- * this class is only used for shuffling (see AntheaEval.deterministicShuffle),
+ * this class is only used for shuffling (see AntheaEval.pseudoRandomShuffle),
  * using seed=0 effectively disables shuffling.
  */
 class AntheaDeterministicRandom {
@@ -898,6 +898,11 @@ class AntheaEval {
 
     /** function */
     this.resizeListener_ = null;
+
+    /** @private {string} Source language */
+    this.srcLang = '';
+    /** @private {string} Target language */
+    this.tgtLang = '';
   }
   /**
    * Escapes HTML to safely render as text.
@@ -913,16 +918,15 @@ class AntheaEval {
   }
 
   /**
-   * Shuffles an array deterministically using the given seed. Using seed=0
-   * results in no shuffling.
+   * Shuffles an array using the given pseudo-random number generator.
+   * If the generator always returns the same value, no shuffling occurs.
    * @param {!Array<!Object>} data
-   * @param {number} seed
+   * @param {!AntheaDeterministicRandom} pseudoRandNumGenerator
    * @return {!Array<!Object>}
    */
-  deterministicShuffle(data, seed) {
-    const prng = new AntheaDeterministicRandom(seed);
+  static pseudoRandomShuffle(data, pseudoRandNumGenerator) {
     const dataWithRandoms =
-        data.map((x) => ({element: x, random: prng.next()}));
+        data.map((x) => ({element: x, random: pseudoRandNumGenerator.next()}));
     dataWithRandoms.sort((a, b) => a.random - b.random);
     return dataWithRandoms.map((x) => x.element);
   }
@@ -978,6 +982,21 @@ class AntheaEval {
   }
 
   /**
+   * Retrieves the error subtype information of an error
+   * using the type and subtype information.
+   * @param {!AntheaError} error
+   * @return {!Array<!Object>}
+   */
+  getErrorSubtypeInfo(error) {
+    let errorInfo = this.config.errors[error.type];
+    if (error.subtype &&
+      errorInfo.subtypes && errorInfo.subtypes[error.subtype]) {
+      errorInfo = errorInfo.subtypes[error.subtype];
+    }
+    return errorInfo;
+  }
+
+  /**
    * Split the eval results for target and target2 in the sideBySide mode.
    * The number of segments will be doubled after splitting and formatted
    * as follows:
@@ -1001,20 +1020,31 @@ class AntheaEval {
           segStartIdxArray[i + 1] :
           evalResults.length;
       // Loop through each doc twice.
-      // 1st time only keep (src, translation) errors.
-      // 2nd time only keep (src, translation2) errors.
+      // 1st time only keep (src, translation, 1) errors.
+      // 2nd time only keep (src, translation2, 2) errors.
+      // number 1 and 2 refer to which_translation_side of omission errors.
+      // Other errors marked on the source side are not affected.
       const validErrorLists = [
-        ['source', 'translation'],
-        ['source', 'translation2']
+        ['source', 'translation', 1],
+        ['source', 'translation2', 2]
       ];
       for (let j = 0; j < validErrorLists.length; j++) {
         // Loop through each segment in a doc.
         for (let s = startIdx; s < endIdx; s++) {
           const evalResultCopy = JSON.parse(JSON.stringify(evalResults[s]));
-          // Split the errors based on their location.
-          evalResultCopy.errors = evalResults[s].errors.filter(
-              (error) => validErrorLists[j].includes(error.location)
-              );
+          evalResultCopy.errors = evalResults[s].errors.filter((error) => {
+            // For omission errors, split based on which_translation_side
+            // in the error subtype information.
+            const errorSubtypeInfo = this.getErrorSubtypeInfo(error);
+            if (errorSubtypeInfo &&
+                errorSubtypeInfo.hasOwnProperty('which_translation_side')) {
+              const translationSide = errorSubtypeInfo.which_translation_side;
+              return this.cursor.sideOrder[translationSide] ===
+                  validErrorLists[j][2];
+            }
+            // For other errors, split based on error.location.
+            return validErrorLists[j].includes(error.location);
+          });
           // Split the hotw_list based on their injection location.
           evalResultCopy.hotw_list = evalResultCopy.hotw_list.filter(
               (hotwError) => validErrorLists[j].includes(hotwError.location)
@@ -1093,13 +1123,10 @@ class AntheaEval {
             subpara.hotwType = '';
           }
         }
-        // Recover visited hotw_list.
         const result = this.evalResults_[seg];
         for (let hotw of result.hotw_list || []) {
-          let side = 1;
-          if (hotw.hasOwnProperty('location')) {
-            side = (hotw.location === 'translation' ? 1 : 2);
-          }
+          const side = (hotw.hasOwnProperty('location') &&
+                        hotw.location !== 'translation') ? 2 : 1;
           const subpara = this.getSubpara(seg, side, hotw.para);
           subpara.hotw = hotw;
           subpara.hotwSpanHTML = hotw.hotw_html;
@@ -1186,9 +1213,15 @@ class AntheaEval {
         splitTwo.doc = (splitTwo.doc - 1) / 2;
         // Merge the errors.
         for (let error of splitTwo.errors) {
-          if (error.location !== 'source') {
-            // Non-source errors should be added into splitOne.
-            // Change translation to translation2 in splitTwo.
+          if (error.location === 'source') {
+            // Only add the omission error which is split
+            // based on which_translation_side.
+            const errorSubtypeInfo = this.getErrorSubtypeInfo(error);
+            if (errorSubtypeInfo &&
+                errorSubtypeInfo.hasOwnProperty('which_translation_side')) {
+              splitOne.errors.push(error);
+            }
+          } else {
             error.location = 'translation2';
             splitOne.errors.push(error);
           }
@@ -1813,6 +1846,7 @@ class AntheaEval {
     if (this.error_ && (this.errorIndex_ == index)) {
       textCls += ' anthea-being-edited';
     }
+    const lang = error.location == 'source' ? this.srcLang : this.tgtLang;
     /**
      * Use 0-width spaces to ensure leading/trailing spaces get shown.
      */
@@ -1821,6 +1855,7 @@ class AntheaEval {
         googdom.createDom(
             'span', {
               dir: 'auto',
+              lang: lang,
               style: 'background-color:' + color,
             },
             '\u200b' + error.selected + '\u200b')));
@@ -2494,9 +2529,10 @@ class AntheaEval {
    * documentation.
    * @param {!Array<string>} tokens
    * @param {!Object} subparaInfo
+   * @param {string} tgtLang
    * @return {?Object}
    */
-  static injectHotwWordsFlipped(tokens, subparaInfo) {
+  static injectHotwWordsFlipped(tokens, subparaInfo, tgtLang) {
     /**
      * Error injection is done by reversing a sequence from tokens that starts
      * and ends within spaces/punctuation (or any single-char tokens) and is
@@ -2524,10 +2560,11 @@ class AntheaEval {
     // Reverse tokens in the range (starti, endi)
     const reversed = tokens.slice(starti + 1, endi).reverse();
     return {
-      tokens: tokens.slice(0, starti + 1).concat(reversed).concat(
-          tokens.slice(endi)),
-      hotwError: '<span class="anthea-hotw-revealed">' + reversed.join('') +
-                 '</span>',
+      tokens: tokens.slice(0, starti + 1)
+                  .concat(reversed)
+                  .concat(tokens.slice(endi)),
+      hotwError: `<span class="anthea-hotw-revealed" lang="${tgtLang}">` +
+          reversed.join('') + '</span>',
       hotwType: 'words-flipped',
     };
   }
@@ -2539,9 +2576,10 @@ class AntheaEval {
    * documentation.
    * @param {!Array<string>} tokens
    * @param {!Object} subparaInfo
+   * @param {string} tgtLang
    * @return {?Object}
    */
-  static injectHotwLettersFlipped(tokens, subparaInfo) {
+  static injectHotwLettersFlipped(tokens, subparaInfo, tgtLang) {
     /**
      * Error injection is done by reversing a long word.
      */
@@ -2581,8 +2619,9 @@ class AntheaEval {
     };
     ret.tokens[index] = tokenLetters.slice(0, startOffset).join('') + rev +
                         tokenLetters.slice(startOffset + sliceLength).join('');
-    ret.hotwError = '<span class="anthea-hotw-revealed">' +
-                    ret.tokens[index] + '</span>';
+    ret.hotwError =
+        `<span class="anthea-hotw-revealed" lang="${tgtLang}">` +
+        ret.tokens[index] + '</span>';
     return ret;
   }
 
@@ -2611,21 +2650,23 @@ class AntheaEval {
    * @param {!Array<string>} tokens
    * @param {!Object} subparaInfo
    * @param {boolean} hotwPretend Only pretend to insert error, for training.
+   * @param {string} tgtLang The target language, for text direction.
    * @return {?Object}
    */
-  static injectHotw(tokens, subparaInfo, hotwPretend) {
+  static injectHotw(tokens, subparaInfo, hotwPretend, tgtLang) {
     if (hotwPretend) {
       return AntheaEval.injectHotwPretend(tokens, subparaInfo);
     }
     /* 60% chance for words-flipped, 40% for letter-flipped */
     const tryWordsFlipped = this.getRandomInt(100) < 60;
     if (tryWordsFlipped) {
-      const ret = AntheaEval.injectHotwWordsFlipped(tokens, subparaInfo);
+      const ret =
+          AntheaEval.injectHotwWordsFlipped(tokens, subparaInfo, tgtLang);
       if (ret) {
         return ret;
       }
     }
-    return AntheaEval.injectHotwLettersFlipped(tokens, subparaInfo);
+    return AntheaEval.injectHotwLettersFlipped(tokens, subparaInfo, tgtLang);
   }
 
   /**
@@ -2714,11 +2755,12 @@ class AntheaEval {
    * @param {number} subparaTokens,
    * @param {number} hotwPercent
    * @param {boolean=} hotwPretend
+   * @param {string=} tgtLang
    * @return {!Array<!Object>}
    */
   static splitAndSpannify(text, addEndSpaces,
                           subparaSentences, subparaTokens,
-                          hotwPercent, hotwPretend=false) {
+                          hotwPercent, hotwPretend=false, tgtLang='') {
     const sentences = text.split('\u200b\u200b');
     const spacesNormalizer = (s) => s.replace(/[\s]+/g, ' ');
     const sentInfos = [];
@@ -2777,7 +2819,8 @@ class AntheaEval {
       subparaInfo.spanHTML = AntheaEval.spannifyTokens(
           tokens, subparaInfo.sentInfos);
       if (hotwPercent > 0 && (100 * Math.random()) < hotwPercent) {
-        const hotw = AntheaEval.injectHotw(tokens, subparaInfo, hotwPretend);
+        const hotw =
+            AntheaEval.injectHotw(tokens, subparaInfo, hotwPretend, tgtLang);
         if (hotw) {
           subparaInfo.hotwSpanHTML = AntheaEval.spannifyTokens(
               hotw.tokens, subparaInfo.sentInfos);
@@ -3825,19 +3868,12 @@ class AntheaEval {
 
   /**
    * Validates the input format of the SIDE_BY_SIDE mode.
-   * The outputs of sys1 and 2 of the same doc should be adjacent.
    * The adjacent docsys should have the same source segments.
    * @param {!Array<!Object>} projectData The input data.
    * @return {boolean}
    */
   validateSideBySideData(projectData) {
     for (let i = 0; i < projectData.length; i += 2) {
-      if (i + 1 < projectData.length && projectData[i].doc !== projectData[i + 1].doc) {
-        this.manager_.log(this.manager_.ERROR,
-                          "The output of system1 and system2 of " +
-                          "the same doc are NOT adjacent in the input!");
-        return false;
-      }
       const docsys = projectData[i];
       const docsys2 = projectData[i + 1];
       if (docsys.srcSegments.length !== docsys2.srcSegments.length) {
@@ -3854,6 +3890,149 @@ class AntheaEval {
       }
     }
     return true;
+  }
+
+  /**
+   * Checks whether all expected docsys indices are present. For SIDE_BY_SIDE
+   * templates, also checks that docsys pairs in the input are still adjacent
+   * in the given order.
+   * @param {number} dataLength The length of the input data.
+   * @param {!Array<number>} dataPresentationOrder A permutation of input data
+   *     indices.
+   * @param {number} groupSize The size of chunks that must remain contiguous.
+   * @return {boolean}
+   */
+  validateDataPresentationOrder(dataLength, dataPresentationOrder, groupSize) {
+    if (dataLength !== dataPresentationOrder.length) {
+      this.manager_.log(
+          this.manager_.ERROR,
+          `Presentation order length (${
+              dataPresentationOrder
+                  .length}) does not match input data length (${
+              dataLength})!`);
+      return false;
+    }
+    const providedIndices = new Set(dataPresentationOrder);
+    const expectedIndices = Array.from({length: dataLength}, (v, i) => i);
+    const hasAllExpectedIndices = expectedIndices.every((v) => providedIndices.has(v));
+    if (!hasAllExpectedIndices) {
+      this.manager_.log(
+          this.manager_.ERROR,
+          'Presentation order is missing one or more expected indices!');
+      return false;
+    }
+    if (groupSize > 1) {
+      if (dataPresentationOrder.length % groupSize !== 0) {
+        this.manager_.log(
+            this.manager_.ERROR,
+            `Input data length prevents forming groups of size ${groupSize}!`);
+        return false;
+      }
+      for (let i = 0; i < dataPresentationOrder.length; i += groupSize) {
+        const sortedDataGroup =
+            dataPresentationOrder.slice(i, i + groupSize).sort();
+        if (sortedDataGroup.at(-1) - sortedDataGroup[0] !== groupSize - 1) {
+          this.manager_.log(
+              this.manager_.ERROR, 'Presentation order separates some groups!');
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Creates a random presentation order, by shuffling the order of groups and
+   * the order of data within each group.
+   * @param {number} dataLength The length of the input data.
+   * @param {number} groupSize The size of groups that should remain contiguous.
+   * @param {!AntheaDeterministicRandom} pseudoRandNumGenerator A random number generator.
+   * @return {!Array<number>}
+   */
+  randomPresentationOrder(dataLength, groupSize, pseudoRandNumGenerator) {
+    const dataPresentationOrder = [];
+    // First decide the order in which to show each group.
+    const groupPresentationOrder = AntheaEval.pseudoRandomShuffle(
+        Array.from({length: dataLength / groupSize}, (v, i) => i),
+        pseudoRandNumGenerator);
+    if (groupSize === 1) {
+      return groupPresentationOrder;
+    }
+    // If groups have multiple items, shuffle within each group.
+    const groupOffsets = Array.from({length: groupSize}, (v, i) => i);
+    groupPresentationOrder.forEach(
+        (groupIdx) => dataPresentationOrder.push(...AntheaEval.pseudoRandomShuffle(
+            groupOffsets.map((offset) => offset + groupIdx * groupSize),
+            pseudoRandNumGenerator)));
+    return dataPresentationOrder;
+  }
+
+  /**
+   * If the JSON parameters provide a presentation order, returns
+   * it. If not but a non-zero shuffle_seed is provided, produces a random
+   * presentation order. Otherwise, returns an unshuffled presentation order.
+   * @param {!Jsonable} parameters The JSON parameters.
+   * @param {number} dataLength The length of the input data.
+   * @param {number} groupSize The size of groups that should remain contiguous.
+   * @return {!Array<number>}
+   */
+  getOrCreateDataPresentationOrder(parameters, dataLength, groupSize) {
+    // A seed of 0 will result in no shuffling.
+    const pseudoRandNumGenerator =
+        new AntheaDeterministicRandom(parameters.shuffle_seed || 0);
+    // If a presentation order is provided, the random number generator is not
+    // used.
+    const dataPresentationOrder = parameters.presentation_order ||
+        this.randomPresentationOrder(
+            dataLength, groupSize, pseudoRandNumGenerator);
+    return dataPresentationOrder;
+  }
+  /**
+   * Builds HTML for target subparagraphs.
+   * Iterates over the provided target subparagraphs, constructs HTML for each,
+   * and accumulates the result in `tgtSpannified`. Also updates the `segment` object
+   * with relevant information, including word count and potential hotword data.
+   * @param {!Element} segment The segment to add the subpara to.
+   * @param {!Array<!Object>} tgtSubparas The target subparas.
+   * @param {string} tgtSpannified The target span HTML.
+   * @param {string} tgtSegmentClass The segment class.
+   * @param {string} tgtParaBreak The target paragraph break.
+   * @param {!Object} evalResult The eval result object.
+   * @param {number} lastTimestampMS The last timestamp.
+   * @param {string} tgtSubparaClassName The target subpara class name.
+   * @return {string} The updated tgtSpannified.
+   */
+  buildTargetSubparaHTML(segment, tgtSubparas, tgtSpannified,
+                         tgtSegmentClass, tgtParaBreak, evalResult,
+                         lastTimestampMS, tgtSubparaClassName) {
+    for (let t = 0; t < tgtSubparas.length; t++) {
+      const tgtSubpara = tgtSubparas[t];
+      tgtSpannified += tgtSubparaClassName + tgtSegmentClass + '">' +
+                      (tgtSubpara.hotwSpanHTML || tgtSubpara.spanHTML) +
+                      '</span>';
+      if (tgtSubpara.ends_with_para_break) {
+        tgtSpannified += tgtParaBreak;
+      }
+      segment.numTgtWords += tgtSubpara.num_words;
+      if (tgtSubpara.hotwError) {
+        tgtSubpara.hotw = {
+          timestamp: lastTimestampMS,
+          injected_error: tgtSubpara.hotwError,
+          hotw_html: tgtSubpara.hotwSpanHTML,
+          hotw_type: tgtSubpara.hotwType,
+          para: t,
+          // Add in the location of where hotw is injected.
+          // It is removed when merging/splitting the saved results.
+          location: tgtSubparaClassName.includes("-target2-") ?
+              'translation2' :
+              'translation',
+          done: false,
+          found: false,
+        };
+        evalResult['hotw_list'].push(tgtSubpara.hotw);
+      }
+    }
+    return tgtSpannified;
   }
 
   /**
@@ -3892,8 +4071,8 @@ class AntheaEval {
     this.contextRow_.style.display = 'none';
 
     const parameters = projectData.parameters || {};
-    const srcLang = parameters.source_language || '';
-    const tgtLang = parameters.target_language || '';
+    this.srcLang = parameters.source_language || '';
+    this.tgtLang = parameters.target_language || '';
 
     let noteToRaters = parameters.hasOwnProperty('note_to_raters') ?
         parameters.note_to_raters :
@@ -3915,17 +4094,19 @@ class AntheaEval {
     /** Are we only pretending to add hotw errors, for training? */
     const hotwPretend = parameters.hotw_pretend || false;
 
-    const srcHeading = srcLang ? ('Source (' + srcLang + ')') : 'Source';
+    const srcHeading =
+        this.srcLang ? ('Source (' + this.srcLang + ')') : 'Source';
     const srcHeadingDiv = googdom.createDom('div', null, srcHeading);
 
     const targetLabel = config.TARGET_SIDE_ONLY ? 'Text' : 'Translation';
-    const tgtHeading = tgtLang ?
-        (targetLabel + ' (' + tgtLang + ')') : targetLabel;
+    const tgtHeading = this.tgtLang ?
+        (targetLabel + ' (' + this.tgtLang + ')') : targetLabel;
     const tgtHeadingDiv = googdom.createDom('div', null, tgtHeading);
 
     // Set up second target column in the sideBySide mode.
     const targetLabel2 = `${targetLabel} 2`;
-    const tgtHeading2 = tgtLang ? `${targetLabel2} (${tgtLang})` : targetLabel2;
+    const tgtHeading2 =
+        this.tgtLang ? `${targetLabel2} (${this.tgtLang})` : targetLabel2;
     const tgtHeadingDiv2 = googdom.createDom('div', null, tgtHeading2);
 
     const evalHeading = this.READ_ONLY ?
@@ -3978,24 +4159,36 @@ class AntheaEval {
     }
     evalDiv.appendChild(docTextTable);
 
-    const srcParaBreak = '</p><p class="anthea-source-para" dir="auto">';
-    const tgtParaBreak = '</p><p class="anthea-target-para" dir="auto">';
+    const srcParaBreak =
+        `</p><p class="anthea-source-para" dir="auto" lang="${this.srcLang}">`;
+    const tgtParaBreak =
+        `</p><p class="anthea-target-para" dir="auto" lang="${this.tgtLang}">`;
 
     let priorResults = [];
     let priorRaters = [];
 
-    const stepSize = config.SIDE_BY_SIDE ? 2 : 1;
-    if (config.SIDE_BY_SIDE) {
-      const validationResult = this.validateSideBySideData(projectData, stepSize);
-      if (!validationResult) {
-        return;
-      }
+    // The size of groups meant to be evaluated together. Shuffling will not
+    // break up these groups.
+    const groupSize = config.SIDE_BY_SIDE ? 2 : 1;
+    if (config.SIDE_BY_SIDE &&
+        !this.validateSideBySideData(projectData, groupSize)) {
+      return;
     }
 
-    // The order of the two targets in the side-by-side mode.
-    const tgtsShuffleSeed = parameters.shuffle_seed || 0;
-    const pseudoRandNumGenerator = new AntheaDeterministicRandom(tgtsShuffleSeed);
-    for (let i = 0; i < projectData.length; i += stepSize) {
+    const dataPresentationOrder = this.getOrCreateDataPresentationOrder(
+        parameters, projectData.length, groupSize);
+    if (!this.validateDataPresentationOrder(
+            projectData.length, dataPresentationOrder, groupSize)) {
+      return;
+    }
+    // Recover presentation order of docsys groups.
+    const groupPresentationOrder = [];
+    for (let i = 0; i < dataPresentationOrder.length; i += groupSize) {
+      groupPresentationOrder.push(
+          Math.floor(dataPresentationOrder[i] / groupSize));
+    }
+
+    for (let i = 0; i < projectData.length; i += groupSize) {
       const docsys = projectData[i];
       const doc = {'docsys': docsys};
       const docsys2 = config.SIDE_BY_SIDE ? projectData[i + 1] : null;
@@ -4015,7 +4208,9 @@ class AntheaEval {
       const tgtsOrder = [1];
       const tgtRows = [docTextTgtRow];
       if (config.SIDE_BY_SIDE) {
-        const tgt2SpliceIndex = pseudoRandNumGenerator.next() < 0.5 ? 1 : 0;
+        // Even indices mean that the first docsys should be on the left.
+        const tgt2SpliceIndex =
+            dataPresentationOrder.indexOf(i) % 2 === 0 ? 1 : 0;
         tgtsOrder.splice(tgt2SpliceIndex, 0, 2);
         tgtRows.splice(tgt2SpliceIndex, 0, docTextTgtRow2);
       }
@@ -4023,8 +4218,6 @@ class AntheaEval {
                                   null, docTextSrcRow,
                                   ...tgtRows,
                                   googdom.createDom('td', 'anthea-document-eval-cell', doc.eval));
-      // Hide all docs for now; we will un-hide the first one later.
-      doc.row.style.display = 'none';
       if (config.TARGET_SIDE_ONLY) {
         docTextSrcRow.style.display = 'none';
       }
@@ -4038,13 +4231,17 @@ class AntheaEval {
       // Create the second target column for sideBySide templates.
       const tgtSegments2 = config.SIDE_BY_SIDE ? docsys2.tgtSegments : null;
       const annotations = docsys.annotations;
-      let srcSpannified = '<p class="anthea-source-para" dir="auto">';
-      let tgtSpannified = '<p class="anthea-target-para" dir="auto">';
-      let tgtSpannified2 = config.SIDE_BY_SIDE ? '<p class="anthea-target-para" dir="auto">' : '';
-      const addEndSpacesSrc = this.isSpaceSepLang(srcLang);
-      const addEndSpacesTgt = this.isSpaceSepLang(tgtLang);
-      for (let i = 0; i < srcSegments.length; i++) {
-        if (srcSegments[i].length == 0) {
+      let srcSpannified =
+          `<p class="anthea-source-para" dir="auto" lang="${this.srcLang}">`;
+      let tgtSpannified =
+          `<p class="anthea-target-para" dir="auto" lang="${this.tgtLang}">`;
+      let tgtSpannified2 = config.SIDE_BY_SIDE ?
+          `<p class="anthea-target-para" dir="auto" lang="${this.tgtLang}">` :
+          '';
+      const addEndSpacesSrc = this.isSpaceSepLang(this.srcLang);
+      const addEndSpacesTgt = this.isSpaceSepLang(this.tgtLang);
+      for (let j = 0; j < srcSegments.length; j++) {
+        if (srcSegments[j].length == 0) {
           /* New paragraph. */
           srcSpannified += srcParaBreak;
           tgtSpannified += tgtParaBreak;
@@ -4061,10 +4258,10 @@ class AntheaEval {
           'hotw_list': [],
         };
         this.evalResults_.push(evalResult);
-        if (i < annotations.length) {
+        if (j < annotations.length) {
           let parsed_anno = {};
           try {
-            parsed_anno = JSON.parse(annotations[i]);
+            parsed_anno = JSON.parse(annotations[j]);
           } catch (err) {
             parsed_anno = {};
           }
@@ -4094,23 +4291,23 @@ class AntheaEval {
 
         const segment = {
           doc: this.docs_.length - 1,
-          srcText: srcSegments[i],
-          tgtText: tgtSegments[i],
-          tgtText2: config.SIDE_BY_SIDE ? tgtSegments2[i] : '',
+          srcText: srcSegments[j],
+          tgtText: tgtSegments[j],
+          tgtText2: config.SIDE_BY_SIDE ? tgtSegments2[j] : '',
           tgtsOrder: tgtsOrder,
           numTgtWords: 0,
           numTgtWords2: 0,
           srcSubparas: AntheaEval.splitAndSpannify(
-              srcSegments[i], addEndSpacesSrc,
+              srcSegments[j], addEndSpacesSrc,
               subparaSentences, subparaTokens, 0),
           tgtSubparas: AntheaEval.splitAndSpannify(
-              tgtSegments[i], addEndSpacesTgt,
+              tgtSegments[j], addEndSpacesTgt,
               subparaSentences, subparaTokens,
-              this.READ_ONLY ? 0 : hotwPercent, hotwPretend),
+              this.READ_ONLY ? 0 : hotwPercent, hotwPretend, this.tgtLang),
           tgtSubparas2: config.SIDE_BY_SIDE ? AntheaEval.splitAndSpannify(
-              tgtSegments2[i], addEndSpacesTgt,
+              tgtSegments2[j], addEndSpacesTgt,
               subparaSentences, subparaTokens,
-              this.READ_ONLY ? 0 : hotwPercent, hotwPretend) : [],
+              this.READ_ONLY ? 0 : hotwPercent, hotwPretend, this.tgtLang) : [],
         };
         const segIndex = this.segments_.length;
         this.segments_.push(segment);
@@ -4124,40 +4321,10 @@ class AntheaEval {
             srcSpannified += srcParaBreak;
           }
         }
-        function buildTargetSubparaHTML(segment, tgtSubparas, tgtSpannified, tgtSegmentClass,
-                                        tgtParaBreak, evalResult, lastTimestampMS, tgtSubparaClassName) {
-          for (let t = 0; t < tgtSubparas.length; t++) {
-            const tgtSubpara = tgtSubparas[t];
-            tgtSpannified += tgtSubparaClassName + tgtSegmentClass + '">' +
-                            (tgtSubpara.hotwSpanHTML || tgtSubpara.spanHTML) +
-                            '</span>';
-            if (tgtSubpara.ends_with_para_break) {
-              tgtSpannified += tgtParaBreak;
-            }
-            segment.numTgtWords += tgtSubpara.num_words;
-            if (tgtSubpara.hotwError) {
-              tgtSubpara.hotw = {
-                timestamp: lastTimestampMS,
-                injected_error: tgtSubpara.hotwError,
-                hotw_html: tgtSubpara.hotwSpanHTML,
-                hotw_type: tgtSubpara.hotwType,
-                para: t,
-                // Add in the location of where hotw is injected.
-                // It is removed when merging/splitting the saved results.
-                location: tgtSubparaClassName.includes("-target2-") ?
-                    'translation2' :
-                    'translation',
-                done: false,
-                found: false,
-              };
-              evalResult['hotw_list'].push(tgtSubpara.hotw);
-            }
-          }
-          return tgtSpannified;
-        }
+
         const tgtSegmentClass = 'anthea-target-segment-' + segIndex;
         const tgtSegmentClass2 = 'anthea-target2-segment-' + segIndex;
-        tgtSpannified = buildTargetSubparaHTML(segment,
+        tgtSpannified = this.buildTargetSubparaHTML(segment,
                                                segment.tgtSubparas,
                                                tgtSpannified,
                                                tgtSegmentClass,
@@ -4166,7 +4333,7 @@ class AntheaEval {
                                                this.lastTimestampMS_,
                                                '<span class="anthea-target-subpara ');
         if (config.SIDE_BY_SIDE) {
-          tgtSpannified2 = buildTargetSubparaHTML(segment,
+          tgtSpannified2 = this.buildTargetSubparaHTML(segment,
                                                   segment.tgtSubparas2,
                                                   tgtSpannified2,
                                                   tgtSegmentClass2,
@@ -4184,7 +4351,11 @@ class AntheaEval {
       if (config.SIDE_BY_SIDE) {
         googdom.setInnerHtml(docTextTgtRow2, tgtSpannified2 + '</p>');
       }
+      // Adjust line height, then hide all but the first group.
       this.adjustHeight(docTextSrcRow, docTextTgtRow, docTextTgtRow2);
+      if (i !== groupSize * groupPresentationOrder[0]) {
+        doc.row.style.display = 'none';
+      }
     }
     // For shared-source templates, verify that every docsys has the same
     // source segments.
@@ -4259,22 +4430,13 @@ class AntheaEval {
       }
     }
 
-    // If a non-zero seed is provided, deterministically shuffle the
-    // presentation order. Otherwise, present the documents in the input order.
-    const shuffle_seed = parameters.shuffle_seed || 0;
-    const presentationOrder = this.deterministicShuffle(
-        Array.from({length: this.docs_.length}, (v, i) => i), shuffle_seed);
-
-    // Show the first document.
-    this.docs_[presentationOrder[0]].row.style.display = '';
-
     this.cursor = new AntheaCursor(
         this.segments_,
         !!config.TARGET_SIDE_ONLY,
         !!config.TARGET_SIDE_FIRST,
         !!config.SIDE_BY_SIDE,
         this.updateProgressForSegment.bind(this),
-        presentationOrder);
+        groupPresentationOrder);
 
     if (noteToRaters) {
       this.config.instructions +=

@@ -14,9 +14,15 @@
 
 #include "scann/distance_measures/one_to_one/jaccard_distance.h"
 
+#include <cstddef>
 #include <cstdint>
 
+#include "absl/base/optimization.h"
+#include "absl/log/check.h"
 #include "absl/numeric/bits.h"
+#include "scann/data_format/datapoint.h"
+#include "scann/distance_measures/one_to_one/common.h"
+#include "scann/oss_wrappers/scann_aligned_malloc.h"
 
 namespace research_scann {
 

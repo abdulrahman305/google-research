@@ -12,9 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <utility>
 
+#include "absl/base/optimization.h"
 #include "scann/base/single_machine_base.h"
+#include "scann/data_format/datapoint.h"
+#include "scann/data_format/dataset.h"
+#include "scann/data_format/docid_collection_interface.h"
+#include "scann/oss_wrappers/scann_status.h"
+#include "scann/utils/common.h"
+#include "scann/utils/types.h"
 
 namespace research_scann {
 
@@ -36,21 +44,21 @@ Status SingleMachineSearcherBase<T>::Mutator::PrepareForBaseMutation(
   searcher_ = searcher;
   searcher_->mutator_outstanding_ = true;
   if (searcher->dataset_) {
-    TF_ASSIGN_OR_RETURN(dataset_mutator_, searcher->dataset_->GetMutator());
+    SCANN_ASSIGN_OR_RETURN(dataset_mutator_, searcher->dataset_->GetMutator());
   }
   if (searcher->hashed_dataset_) {
-    TF_ASSIGN_OR_RETURN(hashed_dataset_mutator_,
-                        searcher->hashed_dataset_->GetMutator());
+    SCANN_ASSIGN_OR_RETURN(hashed_dataset_mutator_,
+                           searcher->hashed_dataset_->GetMutator());
   }
   if (searcher_->reordering_helper_ &&
       searcher_->reordering_helper_->owns_mutation_data_structures()) {
-    TF_ASSIGN_OR_RETURN(reordering_mutator_,
-                        searcher->reordering_helper_->GetMutator());
+    SCANN_ASSIGN_OR_RETURN(reordering_mutator_,
+                           searcher->reordering_helper_->GetMutator());
   }
   if (searcher->docids_ &&
       !SameDocidsInstance(searcher->docids_, searcher->dataset_.get()) &&
       !SameDocidsInstance(searcher->docids_, searcher->hashed_dataset_.get())) {
-    TF_ASSIGN_OR_RETURN(docid_mutator_, searcher->docids_->GetMutator());
+    SCANN_ASSIGN_OR_RETURN(docid_mutator_, searcher->docids_->GetMutator());
   }
   return OkStatus();
 }
@@ -78,6 +86,68 @@ SingleMachineSearcherBase<T>::Mutator::GetNextDatapointIndex() const {
 }
 
 template <typename T>
+Status SingleMachineSearcherBase<T>::Mutator::ValidateForUpdateOrAdd(
+    const DatapointPtr<T>& dptr, string_view docid,
+    const MutationOptions& mo) const {
+  if constexpr (std::is_floating_point_v<T>) {
+    auto vs = dptr.values_span();
+    for (size_t i : IndicesOf(vs)) {
+      if (!ABSL_PREDICT_TRUE(std::isfinite(vs[i]))) {
+        return InvalidArgumentError(absl::StrCat(
+            "NaN or infinity found in ScaNN update.   value = ", vs[i],
+            " dim idx = ", (dptr.indices()) ? dptr.indices()[i] : i,
+            " Docid = ", docid));
+      }
+    }
+  }
+
+  return OkStatus();
+}
+
+template <typename T>
+Status SingleMachineSearcherBase<T>::Mutator::ValidateForUpdate(
+    const DatapointPtr<T>& dptr, DatapointIndex idx,
+    const MutationOptions& mo) const {
+  SCANN_ASSIGN_OR_RETURN(DatapointIndex next_idx, GetNextDatapointIndex());
+  if (idx >= next_idx) {
+    return InvalidArgumentError(absl::StrCat(
+        "Datapoint index ", idx,
+        " is out of range for update.  This index's size is ", next_idx, "."));
+  }
+
+  StatusOr<string_view> docid = searcher_->GetDocid(idx);
+
+  return ValidateForUpdateOrAdd(dptr, docid.ok() ? *docid : "<UNKNOWN DOCID>",
+                                mo);
+}
+
+template <typename T>
+Status SingleMachineSearcherBase<T>::Mutator::ValidateForAdd(
+    const DatapointPtr<T>& dptr, string_view docid,
+    const MutationOptions& mo) const {
+  DatapointIndex dp_idx = kInvalidDatapointIndex;
+  if (LookupDatapointIndex(docid, &dp_idx)) {
+    return FailedPreconditionError(
+        absl::StrCat("Cannot add docid that already exists: ", docid));
+  }
+
+  SCANN_RETURN_IF_ERROR(GetNextDatapointIndex().status());
+  return ValidateForUpdateOrAdd(dptr, docid, mo);
+}
+
+template <typename T>
+Status SingleMachineSearcherBase<T>::Mutator::ValidateForRemove(
+    DatapointIndex idx) const {
+  SCANN_ASSIGN_OR_RETURN(DatapointIndex next_idx, GetNextDatapointIndex());
+  if (idx >= next_idx) {
+    return InvalidArgumentError(absl::StrCat(
+        "Datapoint index ", idx,
+        " is out of range for removal.  This index's size is ", next_idx, "."));
+  }
+  return OkStatus();
+}
+
+template <typename T>
 Status SingleMachineSearcherBase<T>::Mutator::CheckAddDatapointToBaseOptions(
     const MutateBaseOptions& opts) const {
   if (hashed_dataset_mutator_ && !opts.hashed) {
@@ -89,12 +159,26 @@ Status SingleMachineSearcherBase<T>::Mutator::CheckAddDatapointToBaseOptions(
 }
 
 template <typename T>
+absl::StatusOr<Datapoint<T>>
+SingleMachineSearcherBase<T>::Mutator::GetDatapointFromBase(
+    DatapointIndex i) const {
+  if (dataset_mutator_) {
+    return dataset_mutator_->GetDatapoint(i);
+  }
+  if (hashed_dataset_mutator_) {
+    return UnimplementedError(
+        "GetDatapointFromBase not implemented for hashed dataset.");
+  }
+  return UnimplementedError("GetDatapointFromBase not implemented.");
+}
+
+template <typename T>
 StatusOr<DatapointIndex>
 SingleMachineSearcherBase<T>::Mutator::AddDatapointToBase(
     const DatapointPtr<T>& dptr, string_view docid,
     const MutateBaseOptions& opts) {
   SCANN_RETURN_IF_ERROR(CheckAddDatapointToBaseOptions(opts));
-  TF_ASSIGN_OR_RETURN(const DatapointIndex result, GetNextDatapointIndex());
+  SCANN_ASSIGN_OR_RETURN(const DatapointIndex result, GetNextDatapointIndex());
   if (dataset_mutator_) {
     SCANN_RETURN_IF_ERROR(dataset_mutator_->AddDatapoint(dptr, docid));
   }
@@ -106,7 +190,7 @@ SingleMachineSearcherBase<T>::Mutator::AddDatapointToBase(
     SCANN_RETURN_IF_ERROR(docid_mutator_->AddDatapoint(docid));
   }
   if (reordering_mutator_) {
-    TF_ASSIGN_OR_RETURN(auto idx, reordering_mutator_->AddDatapoint(dptr));
+    SCANN_ASSIGN_OR_RETURN(auto idx, reordering_mutator_->AddDatapoint(dptr));
     SCANN_RET_CHECK_EQ(result, idx);
   }
   return result;
@@ -151,8 +235,8 @@ SingleMachineSearcherBase<T>::Mutator::RemoveDatapointFromBase(
     result = searcher_->docids_->size();
   }
   if (reordering_mutator_) {
-    TF_ASSIGN_OR_RETURN(auto swapped_from,
-                        reordering_mutator_->RemoveDatapoint(idx));
+    SCANN_ASSIGN_OR_RETURN(auto swapped_from,
+                           reordering_mutator_->RemoveDatapoint(idx));
     if (result != kInvalidDatapointIndex) {
       SCANN_RET_CHECK_EQ(swapped_from, result);
     }

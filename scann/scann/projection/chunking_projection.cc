@@ -21,12 +21,12 @@
 #include "absl/log/check.h"
 #include "absl/strings/substitute.h"
 #include "scann/data_format/datapoint.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/projection/identity_projection.h"
 #include "scann/projection/projection_base.h"
 #include "scann/utils/common.h"
 #include "scann/utils/datapoint_utils.h"
 #include "scann/utils/types.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -91,6 +91,8 @@ StatusOr<unique_ptr<ChunkingProjection<T>>> BuildFromConfigImpl(
             "will consist entirely of zero-padding.",
             num_blocks, DivRoundUp(input_dim, dims_per_block)));
       }
+      if (num_blocks < DivRoundUp(input_dim, dims_per_block)) {
+      }
       if (num_blocks < 0) {
         return InvalidArgumentError("num_blocks mustn't be negative");
       }
@@ -104,7 +106,7 @@ StatusOr<unique_ptr<ChunkingProjection<T>>>
 ChunkingProjection<T>::BuildFromConfig(
     const ProjectionConfig& config,
     unique_ptr<Projection<T>> initial_projection) {
-  TF_ASSIGN_OR_RETURN(auto result, BuildFromConfigImpl<T>(config));
+  SCANN_ASSIGN_OR_RETURN(auto result, BuildFromConfigImpl<T>(config));
   result->initial_projection_ = std::move(initial_projection);
   return {std::move(result)};
 }
@@ -223,15 +225,24 @@ void ChunkingProjection<T>::ComputeCumulativeDims() {
 }
 
 template <typename T>
+std::optional<SerializedProjection> ChunkingProjection<T>::SerializeToProto()
+    const {
+  if (initial_projection_) {
+    return initial_projection_->SerializeToProto();
+  }
+  return std::nullopt;
+}
+
+template <typename T>
 Status ChunkingProjection<T>::ProjectInput(
     const DatapointPtr<T>& input, ChunkedDatapoint<float>* chunked) const {
-  TF_ASSIGN_OR_RETURN(*chunked, ProjectInputImpl<float>(input));
+  SCANN_ASSIGN_OR_RETURN(*chunked, ProjectInputImpl<float>(input));
   return OkStatus();
 }
 template <typename T>
 Status ChunkingProjection<T>::ProjectInput(
     const DatapointPtr<T>& input, ChunkedDatapoint<double>* chunked) const {
-  TF_ASSIGN_OR_RETURN(*chunked, ProjectInputImpl<double>(input));
+  SCANN_ASSIGN_OR_RETURN(*chunked, ProjectInputImpl<double>(input));
   return OkStatus();
 }
 

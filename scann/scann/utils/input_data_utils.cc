@@ -16,6 +16,7 @@
 
 #include <cstdint>
 
+#include "scann/proto/partitioning.pb.h"
 #include "scann/proto/projection.pb.h"
 
 namespace research_scann {
@@ -40,7 +41,7 @@ StatusOr<DatapointIndex> ComputeConsistentNumPointsFromIndex(
       sz = hashed_dataset->size();
     } else {
       SCANN_RET_CHECK_EQ(sz, hashed_dataset->size())
-              .SetErrorCode(error::INVALID_ARGUMENT)
+              .SetCode(absl::StatusCode::kInvalidArgument)
           << "Mismatch between original and hashed database sizes.";
     }
   }
@@ -52,7 +53,7 @@ StatusOr<DatapointIndex> ComputeConsistentNumPointsFromIndex(
     } else {
       SCANN_RET_CHECK_EQ(sz,
                          pre_quantized_fixed_point->fixed_point_dataset->size())
-              .SetErrorCode(error::INVALID_ARGUMENT)
+              .SetCode(absl::StatusCode::kInvalidArgument)
           << "Mismatch between original/hashed database and fixed-point "
              "database sizes.";
     }
@@ -63,7 +64,7 @@ StatusOr<DatapointIndex> ComputeConsistentNumPointsFromIndex(
       sz = bfloat16_dataset->size();
     } else {
       SCANN_RET_CHECK_EQ(sz, bfloat16_dataset->size())
-              .SetErrorCode(error::INVALID_ARGUMENT)
+              .SetCode(absl::StatusCode::kInvalidArgument)
           << "Mismatch between original/hashed/int8 database and bfloat16 "
              "database sizes.";
     }
@@ -80,7 +81,7 @@ StatusOr<DatapointIndex> ComputeConsistentNumPointsFromIndex(
 }
 
 StatusOr<DimensionIndex> ComputeConsistentDimensionalityFromIndex(
-    const HashConfig& config, const Dataset* dataset,
+    const ScannConfig& config, const Dataset* dataset,
     const DenseDataset<uint8_t>* hashed_dataset,
     const PreQuantizedFixedPoint* pre_quantized_fixed_point,
     const DenseDataset<int16_t>* bfloat16_dataset) {
@@ -100,7 +101,7 @@ StatusOr<DimensionIndex> ComputeConsistentDimensionalityFromIndex(
     if (dims == kInvalidDimension) {
       dims = d;
     } else {
-      SCANN_RET_CHECK_EQ(dims, d).SetErrorCode(error::INVALID_ARGUMENT)
+      SCANN_RET_CHECK_EQ(dims, d).SetCode(absl::StatusCode::kInvalidArgument)
           << "Mismatch between original and fixed-point database "
              "dimensionalities.";
     }
@@ -111,7 +112,7 @@ StatusOr<DimensionIndex> ComputeConsistentDimensionalityFromIndex(
     if (dims == kInvalidDimension) {
       dims = d;
     } else {
-      SCANN_RET_CHECK_EQ(dims, d).SetErrorCode(error::INVALID_ARGUMENT)
+      SCANN_RET_CHECK_EQ(dims, d).SetCode(absl::StatusCode::kInvalidArgument)
           << "Mismatch between original/fixed-point database and bfloat16 "
              "database dimensionalities.";
     }
@@ -123,21 +124,25 @@ StatusOr<DimensionIndex> ComputeConsistentDimensionalityFromIndex(
       if (dims == kInvalidDimension) {
         dims = d;
       } else {
-        SCANN_RET_CHECK_EQ(dims, d).SetErrorCode(error::INVALID_ARGUMENT)
+        SCANN_RET_CHECK_EQ(dims, d).SetCode(absl::StatusCode::kInvalidArgument)
             << "Mismatch between original/fixed-point/bfloat16 and hash "
                "projection dimensionalities.";
       }
     }
     return OkStatus();
   };
-  if (config.has_projection() && config.asymmetric_hash().has_projection())
+  if (config.partitioning().has_projection())
+    SCANN_RETURN_IF_ERROR(projection_check(config.partitioning().projection()));
+  const HashConfig& hash_config = config.hash();
+  if (hash_config.has_projection() &&
+      hash_config.asymmetric_hash().has_projection())
     return InvalidArgumentError(
         "Both hash and its asymmetric_hash subfield have projection configs.");
-  if (config.has_projection())
-    SCANN_RETURN_IF_ERROR(projection_check(config.projection()));
-  if (config.asymmetric_hash().has_projection())
+  if (hash_config.has_projection())
+    SCANN_RETURN_IF_ERROR(projection_check(hash_config.projection()));
+  if (hash_config.asymmetric_hash().has_projection())
     SCANN_RETURN_IF_ERROR(
-        projection_check(config.asymmetric_hash().projection()));
+        projection_check(hash_config.asymmetric_hash().projection()));
 
   if (dims == kInvalidDimension)
     return InvalidArgumentError(

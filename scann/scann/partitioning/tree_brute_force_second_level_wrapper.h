@@ -17,10 +17,13 @@
 #ifndef SCANN_PARTITIONING_TREE_BRUTE_FORCE_SECOND_LEVEL_WRAPPER_H_
 #define SCANN_PARTITIONING_TREE_BRUTE_FORCE_SECOND_LEVEL_WRAPPER_H_
 
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include "scann/brute_force/brute_force.h"
 #include "scann/partitioning/kmeans_tree_like_partitioner.h"
+#include "scann/partitioning/kmeans_tree_partitioner.pb.h"
 #include "scann/proto/partitioning.pb.h"
 #include "scann/tree_x_hybrid/tree_x_hybrid_smmd.h"
 #include "scann/trees/kmeans_tree/kmeans_tree.h"
@@ -34,11 +37,11 @@ class TreeBruteForceSecondLevelWrapper final
     : public KMeansTreeLikePartitioner<T> {
  public:
   TreeBruteForceSecondLevelWrapper(
-      unique_ptr<KMeansTreeLikePartitioner<T>> base,
-      DatapointIndex top_level_centroids,
-      DatapointIndex top_level_centroids_to_search, float avq_eta,
-      float orthogonality_amplification_lambda,
-      float spilling_overretrieve_factor);
+      unique_ptr<KMeansTreeLikePartitioner<T>> base);
+
+  Status CreatePartitioning(
+      const BottomUpTopLevelPartitioner& config,
+      std::optional<SerializedKMeansTreePartitioner> serialized = std::nullopt);
 
   const shared_ptr<const DistanceMeasure>& query_tokenization_distance()
       const final {
@@ -60,8 +63,8 @@ class TreeBruteForceSecondLevelWrapper final
 
   Status TokensForDatapointWithSpillingBatched(
       const TypedDataset<T>& queries, ConstSpan<int32_t> max_centers_override,
-      MutableSpan<std::vector<pair<DatapointIndex, float>>> results)
-      const final;
+      MutableSpan<std::vector<pair<DatapointIndex, float>>> results,
+      ThreadPool* pool = nullptr) const final;
 
   Status TokenForDatapoint(const DatapointPtr<T>& dptr,
                            pair<DatapointIndex, float>* result) const final {
@@ -86,13 +89,9 @@ class TreeBruteForceSecondLevelWrapper final
     return base_->LeafCenters();
   }
 
-  void CopyToProto(SerializedPartitioner* result) const final {
-    base_->CopyToProto(result);
-  }
+  void CopyToProto(SerializedPartitioner* result) const final;
   int32_t n_tokens() const final { return base_->n_tokens(); }
-  unique_ptr<Partitioner<T>> Clone() const final {
-    LOG(FATAL) << "Not implemented";
-  }
+  unique_ptr<Partitioner<T>> Clone() const final;
 
   Status TokenForDatapoint(const DatapointPtr<T>& query,
                            int32_t* result) const final {
@@ -118,17 +117,25 @@ class TreeBruteForceSecondLevelWrapper final
     return base_->query_spilling_max_centers();
   }
 
+  const KMeansTreeLikePartitioner<T>* base() const { return base_.get(); }
+  KMeansTreeLikePartitioner<T>* base() { return base_.get(); }
+  const TreeXHybridSMMD<float>* top_level() const { return top_level_.get(); }
+
  private:
+  void OnSetTokenizationMode() final {
+    base_->set_tokenization_mode(this->tokenization_mode());
+  }
+
   TreeBruteForceSecondLevelWrapper() = default;
   static StatusOrPtr<TreeXHybridSMMD<float>> CreateTopLevel(
       const KMeansTreeLikePartitioner<T>& base,
-      DatapointIndex top_level_centroids,
-      DatapointIndex top_level_centroids_to_search, float avq_eta,
-      float orthogonality_amplification_lambda,
-      float spilling_overretrieve_factor);
+      const BottomUpTopLevelPartitioner& config,
+      std::optional<SerializedKMeansTreePartitioner> serialized);
 
   unique_ptr<KMeansTreeLikePartitioner<T>> base_;
   unique_ptr<TreeXHybridSMMD<float>> top_level_;
+
+  BottomUpTopLevelPartitioner config_;
 };
 
 SCANN_INSTANTIATE_TYPED_CLASS(extern, TreeBruteForceSecondLevelWrapper);

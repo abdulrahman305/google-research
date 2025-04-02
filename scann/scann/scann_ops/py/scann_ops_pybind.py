@@ -15,14 +15,11 @@
 
 """Wrapper around pybind module that provides convenience functions for instantiating ScaNN searchers."""
 
-# pylint: disable=g-import-not-at-top,g-bad-import-order,unused-import
-import pickle as pkl
 import os
+import pickle as pkl
+import numpy as np
 import sys
 
-# needed because of C++ dependency on TF headers
-import numpy as np
-import tensorflow as _tf
 sys.path.append(
     os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -51,16 +48,14 @@ class ScannSearcher(object):
   def search(
       self,
       q,
-      final_num_neighbors=None,
-      pre_reorder_num_neighbors=None,
-      leaves_to_search=None,
+      final_num_neighbors=-1,
+      pre_reorder_num_neighbors=-1,
+      leaves_to_search=-1,
   ):
-    """Search method for a single query."""
-    final_nn = -1 if final_num_neighbors is None else final_num_neighbors
-    pre_nn = (-1 if pre_reorder_num_neighbors is None else
-              pre_reorder_num_neighbors)
-    leaves = -1 if leaves_to_search is None else leaves_to_search
-    idx, dist = self.searcher.search(q, final_nn, pre_nn, leaves)
+    """Single-query search; -1 for a param uses the searcher's default value."""
+    idx, dist = self.searcher.search(q, final_num_neighbors,
+                                     pre_reorder_num_neighbors,
+                                     leaves_to_search)
     idx = idx if self.docids is None else [self.docids[j] for j in idx]
     return idx, dist
 
@@ -82,7 +77,7 @@ class ScannSearcher(object):
         pre_nn,
         leaves,
         False,
-        0  # Ignored when parallel=False.
+        0,  # Ignored when parallel=False.
     )
     idx = (
         idx
@@ -109,12 +104,18 @@ class ScannSearcher(object):
         if self.docids is None else [[self.docids[j] for j in i] for i in idx])
     return idx, dist
 
-  def serialize(self, artifacts_dir):
-    self.searcher.serialize(artifacts_dir)
+  def serialize(self, artifacts_dir, relative_path=False):
+    self.searcher.serialize(artifacts_dir, relative_path)
     docids_fn = os.path.join(artifacts_dir, "scann_docids.pkl")
 
     if self.docids is not None:
       pkl.dump(self.docids, _open(docids_fn, "wb"))
+
+  def get_health_stats(self):
+    return self.searcher.get_health_stats()
+
+  def initialize_health_stats(self):
+    return self.searcher.initialize_health_stats()
 
   def upsert(self, docids, database, batch_size=1):
     """Insert or update datapoints into the searcher."""

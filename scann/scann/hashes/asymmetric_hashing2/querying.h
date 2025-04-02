@@ -21,28 +21,28 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "absl/flags/flag.h"
-#include "absl/types/span.h"
-#include "scann/base/restrict_allowlist.h"
+#include "absl/strings/str_cat.h"
 #include "scann/base/search_parameters.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
 #include "scann/distance_measures/distance_measure_base.h"
-#include "scann/hashes/asymmetric_hashing2/training.h"
-#include "scann/hashes/asymmetric_hashing2/training_options.h"
+#include "scann/hashes/asymmetric_hashing2/training_model.h"
 #include "scann/hashes/internal/asymmetric_hashing_impl.h"
 #include "scann/hashes/internal/asymmetric_hashing_lut16.h"
 #include "scann/hashes/internal/asymmetric_hashing_postprocess.h"
+#include "scann/hashes/internal/lut16_args.h"
+#include "scann/hashes/internal/lut16_interface.h"
 #include "scann/projection/chunking_projection.h"
 #include "scann/proto/hash.pb.h"
+#include "scann/restricts/restrict_allowlist.h"
 #include "scann/utils/common.h"
+#include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/top_n_amortized_constant.h"
 #include "scann/utils/types.h"
 #include "scann/utils/util_functions.h"
@@ -63,6 +63,9 @@ struct LookupTable {
   float fixed_point_multiplier = NAN;
 
   bool can_use_int16_accumulator = false;
+
+  absl::StatusOr<std::vector<uint8_t>> ToBytes() const;
+  static absl::StatusOr<LookupTable> FromBytes(absl::Span<const uint8_t> bytes);
 };
 
 struct PackedDataset {
@@ -75,8 +78,6 @@ struct PackedDataset {
 
 PackedDataset CreatePackedDataset(const DenseDataset<uint8_t>& hashed_database);
 
-DenseDataset<uint8_t> UnpackDataset(const PackedDataset& packed);
-
 struct PackedDatasetView {
   ConstSpan<uint8_t> bit_packed_data = {};
 
@@ -85,7 +86,24 @@ struct PackedDatasetView {
   DimensionIndex num_blocks = 0;
 };
 
+struct PackedDatasetMutableView {
+  MutableSpan<uint8_t> bit_packed_data = {};
+
+  DatapointIndex num_datapoints = 0;
+
+  DimensionIndex num_blocks = 0;
+};
+
+DenseDataset<uint8_t> UnpackDataset(const PackedDatasetView& packed);
+
 PackedDatasetView CreatePackedDatasetView(const PackedDataset& packed_dataset);
+
+template <typename Dataset>
+Status SetLUT16Hash(const DatapointPtr<uint8_t>& hashed, size_t index,
+                    Dataset* __restrict__ packed_struct);
+
+template <typename Dataset>
+Datapoint<uint8_t> GetLUT16Hash(size_t index, const Dataset& packed_dataset);
 
 template <typename PostprocessFunctor =
               asymmetric_hashing_internal::IdentityPostprocessFunctor,
@@ -246,10 +264,11 @@ StatusOr<LookupTable> AsymmetricQueryer<T>::CreateLookupTable(
       return query;
     }
   }();
-  TF_ASSIGN_OR_RETURN(auto raw_float_lookup,
-                      asymmetric_hashing_internal::CreateRawFloatLookupTable(
-                          query_no_bias, *projector_, lookup_distance,
-                          model_->centers(), model_->num_clusters_per_block()));
+  SCANN_ASSIGN_OR_RETURN(
+      auto raw_float_lookup,
+      asymmetric_hashing_internal::CreateRawFloatLookupTable(
+          query_no_bias, *projector_, lookup_distance, model_->centers(),
+          model_->num_clusters_per_block()));
 
   LookupTable result;
   if (IsIntegerType<LookupElement>() &&
@@ -314,7 +333,6 @@ Status AsymmetricQueryer<T>::FindApproximateNeighbors(
   }
 
   const bool can_use_lut16 =
-      RuntimeSupportsSse4() &&
       querying_options.lut16_packed_dataset.has_value() &&
       !lookup_table.int8_lookup_table.empty() &&
       lookup_table.int8_lookup_table.size() /
@@ -450,7 +468,6 @@ Status AsymmetricQueryer<T>::FindApproximateNeighborsBatched(
 
   const bool can_use_lut16_for_all = [&] {
     if (!std::is_same_v<Functor, IdentityPostprocessFunctor>) return false;
-    if (!RuntimeSupportsSse4()) return false;
     if (!querying_options.lut16_packed_dataset.has_value()) return false;
     for (const LookupTable* lt : lookup_tables) {
       if (lt->int8_lookup_table.empty()) return false;
@@ -808,14 +825,32 @@ Status AsymmetricQueryer<T>::PopulateDistancesImpl(
 
   ai::PopulateDistancesIterator<6, Functor> it(
       results, querying_options.postprocessing_functor);
-  auto fp = &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
-      DatasetView, LookupElement, 0, decltype(it)>;
+
+  constexpr size_t kAssumedL2CacheSize = 256 * 1024;
+  const size_t lut_bytes = lookup_raw.size() * sizeof(LookupElement);
+  const size_t bytes_per_unroll = num_hashes * it.kUnrollFactor;
+  const size_t total_l2_bytes_required = bytes_per_unroll * 2 + lut_bytes;
+  const bool should_prefetch =
+      total_l2_bytes_required <= kAssumedL2CacheSize / 2;
+
+  auto fp =
+      should_prefetch
+          ? &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                DatasetView, LookupElement, 0, decltype(it), true>
+          : &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                DatasetView, LookupElement, 0, decltype(it), false>;
   if (num_clusters_per_block == 256) {
-    fp = &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
-        DatasetView, LookupElement, 256, decltype(it)>;
+    fp = should_prefetch
+             ? &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                   DatasetView, LookupElement, 256, decltype(it), true>
+             : &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                   DatasetView, LookupElement, 256, decltype(it), false>;
   } else if (num_clusters_per_block == 128) {
-    fp = &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
-        DatasetView, LookupElement, 128, decltype(it)>;
+    fp = should_prefetch
+             ? &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                   DatasetView, LookupElement, 128, decltype(it), true>
+             : &ai::GetNeighborsViaAsymmetricDistanceWithCompileTimeNumCenters<
+                   DatasetView, LookupElement, 128, decltype(it), false>;
   }
 
   (*fp)(lookup_raw, num_clusters_per_block, hashed_dataset, it);
@@ -829,6 +864,16 @@ Status AsymmetricQueryer<T>::PopulateDistancesImpl(
   return OkStatus();
 }
 
+extern template Status SetLUT16Hash<PackedDataset>(
+    const DatapointPtr<uint8_t>& hashed, size_t index,
+    PackedDataset* __restrict__ packed_struct);
+extern template Status SetLUT16Hash<PackedDatasetMutableView>(
+    const DatapointPtr<uint8_t>& hashed, size_t index,
+    PackedDatasetMutableView* __restrict__ packed_struct);
+extern template Datapoint<uint8_t> GetLUT16Hash<PackedDataset>(
+    size_t index, const PackedDataset& packed_dataset);
+extern template Datapoint<uint8_t> GetLUT16Hash<PackedDatasetMutableView>(
+    size_t index, const PackedDatasetMutableView& packed_dataset);
 SCANN_INSTANTIATE_TYPED_CLASS(extern, AsymmetricQueryer);
 
 }  // namespace asymmetric_hashing2

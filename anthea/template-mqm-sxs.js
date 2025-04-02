@@ -123,10 +123,17 @@ antheaTemplates['MQM-SxS'] = {
           display: 'Addition',
           description: 'The target text includes information not present in the source.',
         },
-        omission: {
-          display: 'Omission',
-          description: 'Content is missing from the translation that is present in the source.',
+        omission_translation: {
+          display: 'Omission (Translation)',
+          description: 'Content is missing from the first (left) translation that is present in the source.',
           source_side_only: true,
+          which_translation_side: 1
+        },
+        omission_translation_2: {
+          display: 'Omission (Translation 2)',
+          description: 'Content is missing from the second (right) translation that is present in the source.',
+          source_side_only: true,
+          which_translation_side: 2
         },
       },
     },
@@ -334,6 +341,9 @@ antheaTemplates['MQM-SxS'] = {
               latter part (“auf”, “up”). The text between “teilte” and “auf”,
               or between “called” and “up”, should not be included in the span
               if the issue is with the verb only (“aufteilen”, “call up”).
+          </li>
+          <li>If the same error is present in both translations, please make
+              sure to mark the error in both translations.
           </li>
           <li>Note: issues can appear either in the translations, or
               rarely, for the "Source issue" type, in the source. When

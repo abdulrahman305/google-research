@@ -16,10 +16,16 @@
 
 #include <cstdint>
 #include <numeric>
+#include <utility>
 
-#include "scann/oss_wrappers/scann_aligned_malloc.h"
-#include "scann/utils/zip_sort.h"
-#include "tensorflow/core/platform/prefetch.h"
+#include "absl/log/check.h"
+#include "scann/data_format/dataset.h"
+#include "scann/distance_measures/distance_measure_base.h"
+#include "scann/trees/kmeans_tree/kmeans_tree.pb.h"
+#include "scann/trees/kmeans_tree/kmeans_tree_node.h"
+#include "scann/trees/kmeans_tree/training_options.h"
+#include "scann/utils/common.h"
+#include "scann/utils/types.h"
 
 namespace research_scann {
 
@@ -40,7 +46,7 @@ int32_t CountLeaves(const KMeansTreeNode& node) {
 
 }  // namespace
 
-KMeansTree::KMeansTree() {}
+KMeansTree::KMeansTree() = default;
 
 KMeansTree::KMeansTree(const SerializedKMeansTree& serialized) {
   learned_spilling_type_ = serialized.learned_spilling_type();
@@ -50,6 +56,17 @@ KMeansTree::KMeansTree(const SerializedKMeansTree& serialized) {
   root_.PopulateCurNodeCenters();
   root_.CreateFixedPointCenters();
   CheckIfFlat();
+}
+
+KMeansTree KMeansTree::CreateFlat(DenseDataset<float> centers) {
+  KMeansTree result;
+  result.root_ = KMeansTreeNode::CreateFlat(std::move(centers));
+  result.n_tokens_ = CountLeaves(result.root_);
+  result.root_.PopulateCurNodeCenters();
+  result.root_.CreateFixedPointCenters();
+  result.CheckIfFlat();
+  CHECK(result.is_flat_);
+  return result;
 }
 
 Status KMeansTree::Train(const Dataset& training_data,

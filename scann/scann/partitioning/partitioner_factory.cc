@@ -27,12 +27,15 @@
 #include "absl/time/time.h"
 #include "scann/distance_measures/distance_measure_factory.h"
 #include "scann/oss_wrappers/scann_random.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/partitioning/kmeans_tree_partitioner.pb.h"
 #include "scann/partitioning/kmeans_tree_partitioner_utils.h"
 #include "scann/partitioning/partitioner.pb.h"
 #include "scann/partitioning/partitioner_base.h"
 #include "scann/partitioning/partitioner_factory_base.h"
 #include "scann/partitioning/projecting_decorator.h"
+#include "scann/partitioning/tree_brute_force_second_level_wrapper.h"
+#include "scann/projection/pca_projection.h"
 #include "scann/projection/projection_base.h"
 #include "scann/projection/projection_factory.h"
 #include "scann/proto/distance_measure.pb.h"
@@ -40,21 +43,20 @@
 #include "scann/utils/common.h"
 #include "scann/utils/types.h"
 #include "scann/utils/weak_ptr_cache.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
 namespace {
 template <typename T>
-StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTreeNoProjection(
-    shared_ptr<const KMeansTree> kmeans_tree,
-    const PartitioningConfig& config) {
-  TF_ASSIGN_OR_RETURN(auto training_dist,
-                      GetDistanceMeasure(config.partitioning_distance()));
+StatusOr<unique_ptr<KMeansTreePartitioner<T>>>
+PartitionerFromKMeansTreeNoProjection(shared_ptr<const KMeansTree> kmeans_tree,
+                                      const PartitioningConfig& config) {
+  SCANN_ASSIGN_OR_RETURN(auto training_dist,
+                         GetDistanceMeasure(config.partitioning_distance()));
 
   shared_ptr<const DistanceMeasure> database_tokenization_dist;
   if (config.has_database_tokenization_distance_override()) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         database_tokenization_dist,
         GetDistanceMeasure(config.database_tokenization_distance_override()));
   } else {
@@ -63,7 +65,7 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTreeNoProjection(
 
   shared_ptr<const DistanceMeasure> query_tokenization_dist;
   if (config.has_query_tokenization_distance_override()) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         query_tokenization_dist,
         GetDistanceMeasure(config.query_tokenization_distance_override()));
   } else {
@@ -114,8 +116,8 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTreeNoProjection(
     km->SetDatabaseTokenizationType(
         research_scann::KMeansTreePartitioner<T>::ASYMMETRIC_HASHING);
   }
-
-  return unique_ptr<Partitioner<T>>(std::move(km));
+  km->SetNumTokenizedBranch(config.num_tokenized_branch());
+  return km;
 }
 }  // namespace
 
@@ -130,12 +132,24 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerializedImpl(
         "populated.");
   }
 
-  StatusOr<unique_ptr<Partitioner<T>>> result;
   if (proto.has_kmeans()) {
     auto kmeans_tree =
         std::make_shared<KMeansTree>(proto.kmeans().kmeans_tree());
-    return PartitionerFromKMeansTreeNoProjection<T>(std::move(kmeans_tree),
-                                                    config);
+    SCANN_ASSIGN_OR_RETURN(auto partitioner,
+                           PartitionerFromKMeansTreeNoProjection<T>(
+                               std::move(kmeans_tree), config));
+    if (config.bottom_up_top_level_partitioner().enabled() &&
+        proto.kmeans().has_next_bottom_up_level()) {
+      LOG(INFO) << "Deserializing top level partitioners.";
+      auto wrapper = make_unique<TreeBruteForceSecondLevelWrapper<T>>(
+          std::move(partitioner));
+      SCANN_RETURN_IF_ERROR(
+          wrapper->CreatePartitioning(config.bottom_up_top_level_partitioner(),
+                                      proto.kmeans().next_bottom_up_level()));
+      return wrapper;
+    } else {
+      return partitioner;
+    }
   } else if (proto.has_linear_projection()) {
     return InternalError("Linear projection tree partitioners not supported.");
   }
@@ -158,11 +172,38 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerialized(
   }
 
   unique_ptr<Projection<T>> projection;
-  TF_ASSIGN_OR_RETURN(projection, ProjectionFactory<T>(config.projection(),
-                                                       projection_seed_offset));
+  if (config.projection().projection_type() == ProjectionConfig::PCA) {
+    if (proto.serialized_projection().rotation_vec().empty()) {
+      return InvalidArgumentError(
+          "Cannot build a PCA projected partitioner from a "
+          "SerializedPartitioner that lacks PCA rotation_vecs.");
+    }
+    DenseDataset<float> rotation_vecs;
+    for (const GenericFeatureVector& gfv :
+         proto.serialized_projection().rotation_vec()) {
+      SCANN_RETURN_IF_ERROR(rotation_vecs.Append(gfv, ""));
+    }
+    if (config.projection().has_num_dims_per_block()) {
+      if (config.projection().num_dims_per_block() != rotation_vecs.size()) {
+        return InvalidArgumentError(
+            "For PCA projection, num_dims_per_block (%d) must match the "
+            "dimension of the rotation_vecs (%d) in the SerializedPartitioner "
+            "if num_dims_per_block is specified.",
+            config.projection().num_dims_per_block(), rotation_vecs.size());
+      }
+    }
+    auto pca_projection = make_unique<PcaProjection<T>>(
+        config.projection().input_dim(), rotation_vecs.size());
+    pca_projection->Create(std::move(rotation_vecs));
+    projection = std::move(pca_projection);
+  } else {
+    SCANN_ASSIGN_OR_RETURN(
+        projection,
+        ProjectionFactory<T>(config.projection(), projection_seed_offset));
+  }
 
-  TF_ASSIGN_OR_RETURN(auto partitioner,
-                      PartitionerFromSerializedImpl<float>(proto, config));
+  SCANN_ASSIGN_OR_RETURN(auto partitioner,
+                         PartitionerFromSerializedImpl<float>(proto, config));
 
   return MakeProjectingDecorator<T>(std::move(projection),
                                     std::move(partitioner));
@@ -175,11 +216,11 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
   if (!config.has_projection()) {
     return PartitionerFromKMeansTreeNoProjection<T>(kmeans_tree, config);
   }
-  TF_ASSIGN_OR_RETURN(
+  SCANN_ASSIGN_OR_RETURN(
       auto partitioner,
       PartitionerFromKMeansTreeNoProjection<float>(kmeans_tree, config));
-  TF_ASSIGN_OR_RETURN(auto projection,
-                      ProjectionFactory<T>(config.projection()));
+  SCANN_ASSIGN_OR_RETURN(auto projection,
+                         ProjectionFactory<T>(config.projection()));
   return MakeProjectingDecorator<T>(std::move(projection),
                                     std::move(partitioner));
 }

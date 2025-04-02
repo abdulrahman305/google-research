@@ -31,6 +31,7 @@
 #include "scann/distance_measures/many_to_many/many_to_many.h"
 #include "scann/oss_wrappers/scann_down_cast.h"
 #include "scann/oss_wrappers/scann_status.h"
+#include "scann/oss_wrappers/scann_threadpool.h"
 #include "scann/partitioning/kmeans_tree_partitioner.pb.h"
 #include "scann/partitioning/partitioner_base.h"
 #include "scann/proto/partitioning.pb.h"
@@ -40,7 +41,6 @@
 #include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/types.h"
 #include "scann/utils/zip_sort.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -88,6 +88,7 @@ unique_ptr<Partitioner<T>> KMeansTreePartitioner<T>::Clone() const {
   result->orthogonality_amplification_lambda_ =
       orthogonality_amplification_lambda_;
   result->query_tokenization_searcher_ = query_tokenization_searcher_;
+  result->num_tokenized_branch_ = num_tokenized_branch_;
   return std::move(result);
 }
 
@@ -141,11 +142,12 @@ Status KMeansTreePartitioner<T>::TokenForDatapoint(
     vector<pair<DatapointIndex, float>> result_vec;
     const shared_ptr<const DistanceMeasure>& dist =
         is_query_mode ? query_tokenization_dist_ : database_tokenization_dist_;
-    SCANN_RETURN_IF_ERROR(kmeans_tree_->Tokenize(
-        dptr, *dist,
-        KMeansTree::TokenizationOptions::NoSpilling(
-            static_cast<KMeansTree::TokenizationType>(cur_type)),
-        &result_vec));
+
+    auto tokenization_options = KMeansTree::TokenizationOptions::NoSpilling(
+        static_cast<KMeansTree::TokenizationType>(cur_type));
+    tokenization_options.num_tokenized_branch = num_tokenized_branch_;
+    SCANN_RETURN_IF_ERROR(
+        kmeans_tree_->Tokenize(dptr, *dist, tokenization_options, &result_vec));
     *result = result_vec[0];
     return OkStatus();
   }
@@ -159,8 +161,8 @@ Status KMeansTreePartitioner<T>::TokenForDatapointBatched(
       !kmeans_tree_->is_flat()) {
     return Partitioner<T>::TokenForDatapointBatched(queries, results);
   }
-  TF_ASSIGN_OR_RETURN(auto top1_results,
-                      TokenForDatapointBatchedImpl(queries, pool));
+  SCANN_ASSIGN_OR_RETURN(auto top1_results,
+                         TokenForDatapointBatchedImpl(queries, pool));
   results->resize(queries.size());
   for (size_t j : Seq(queries.size())) {
     (*results)[j] = static_cast<int32_t>(top1_results[j].first);
@@ -179,7 +181,7 @@ Status KMeansTreePartitioner<T>::TokenForDatapointBatched(
       SCANN_RETURN_IF_ERROR(TokenForDatapoint(queries[i], &results->at(i)));
     }
   }
-  TF_ASSIGN_OR_RETURN(*results, TokenForDatapointBatchedImpl(queries, pool));
+  SCANN_ASSIGN_OR_RETURN(*results, TokenForDatapointBatchedImpl(queries, pool));
   return OkStatus();
 }
 
@@ -383,7 +385,9 @@ Datapoint<FloatT> ResidualizeImpl(const DatapointPtr<T>& dptr,
 template <typename T>
 StatusOr<Datapoint<float>> KMeansTreePartitioner<T>::ResidualizeToFloat(
     const DatapointPtr<T>& dptr, int32_t token) const {
-  DatapointPtr<float> center = kmeans_tree()->CenterForToken(token);
+  const DatapointPtr<float> center = kmeans_tree()->is_flat()
+                                         ? LeafCenters()[token]
+                                         : kmeans_tree()->CenterForToken(token);
   return ResidualizeImpl<float>(dptr, center);
 }
 
@@ -511,6 +515,9 @@ KMeansTreePartitioner<T>::TokenizeDatabase(const TypedDataset<T>& database,
       SCANN_RETURN_IF_ERROR(ApplyAvq(dense(), token_to_datapoint_index,
                                      avq_opts.avq_eta, pool_or_null));
     }
+    if (avq_opts.skip_secondary_tokenization) {
+      return token_to_datapoint_index;
+    }
     vector<pair<DatapointIndex, float>> secondary_results(
         primary_results.size());
     SCANN_RETURN_IF_ERROR(OrthogonalityAmplifiedTokenForDatapointBatched(
@@ -534,8 +541,8 @@ KMeansTreePartitioner<T>::TokenizeDatabase(const TypedDataset<T>& database,
                  DatabaseSpillingConfig::NO_SPILLING &&
              (IsSame<T, float>() || IsSame<T, double>()) &&
              (database_tokenization_type_ == FLOAT)) {
-    TF_ASSIGN_OR_RETURN(auto datapoint_index_to_result,
-                        TokenizeDatabaseImplFastPath(dense(), pool_or_null));
+    SCANN_ASSIGN_OR_RETURN(auto datapoint_index_to_result,
+                           TokenizeDatabaseImplFastPath(dense(), pool_or_null));
     vector<std::vector<DatapointIndex>> token_to_datapoint_index(
         this->n_tokens());
     for (DatapointIndex dp_index : IndicesOf(datapoint_index_to_result)) {
@@ -551,7 +558,7 @@ KMeansTreePartitioner<T>::TokenizeDatabase(const TypedDataset<T>& database,
     }
     return std::move(token_to_datapoint_index);
   } else {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         auto result, Partitioner<T>::TokenizeDatabase(database, pool_or_null));
     if (avq_opts.avq_after_primary) {
       SCANN_RETURN_IF_ERROR(ApplyAvq(dense(), result, avq_opts.avq_eta));
@@ -571,7 +578,7 @@ KMeansTreePartitioner<T>::TokenizeDatabaseImplFastPath(
   }
 
   DCHECK_EQ(database_tokenization_type_, FLOAT);
-  TF_ASSIGN_OR_RETURN(
+  SCANN_ASSIGN_OR_RETURN(
       datapoint_index_to_result,
       TokenizeDatabaseImplFastPath(database, kmeans_tree_->root()->Centers(),
                                    pool_or_null));
@@ -616,10 +623,10 @@ template <typename T>
 Status
 KMeansTreePartitioner<T>::TokensForDatapointWithSpillingBatchedAndOverride(
     const TypedDataset<T>& queries, ConstSpan<int32_t> max_centers_override,
-    MutableSpan<vector<int32_t>> results) const {
+    MutableSpan<vector<int32_t>> results, ThreadPool* pool) const {
   vector<vector<pair<DatapointIndex, float>>> raw_results(queries.size());
   SCANN_RETURN_IF_ERROR(TokensForDatapointWithSpillingBatched(
-      queries, max_centers_override, MakeMutableSpan(raw_results)));
+      queries, max_centers_override, MakeMutableSpan(raw_results), pool));
   for (size_t i = 0; i < results.size(); ++i) {
     vector<int32_t>& cur_results = results[i];
     auto& cur_raw_results = raw_results[i];
@@ -635,7 +642,8 @@ KMeansTreePartitioner<T>::TokensForDatapointWithSpillingBatchedAndOverride(
 template <typename T>
 Status KMeansTreePartitioner<T>::TokensForDatapointWithSpillingBatched(
     const TypedDataset<T>& queries, ConstSpan<int32_t> max_centers_override,
-    MutableSpan<vector<pair<DatapointIndex, float>>> results) const {
+    MutableSpan<vector<pair<DatapointIndex, float>>> results,
+    ThreadPool* pool) const {
   if (!max_centers_override.empty() &&
       queries.size() != max_centers_override.size()) {
     return InvalidArgumentError(
@@ -661,11 +669,11 @@ Status KMeansTreePartitioner<T>::TokensForDatapointWithSpillingBatched(
       }
       vector<pair<DatapointIndex, float>> primary_results;
       SCANN_RETURN_IF_ERROR(
-          TokenForDatapointBatched(queries, &primary_results, nullptr));
+          TokenForDatapointBatched(queries, &primary_results, pool));
       vector<pair<DatapointIndex, float>> secondary_results(results.size());
       SCANN_RETURN_IF_ERROR(OrthogonalityAmplifiedTokenForDatapointBatched(
           *down_cast<const DenseDataset<T>*>(&queries), primary_results,
-          MakeMutableSpan(secondary_results), nullptr));
+          MakeMutableSpan(secondary_results), pool));
       for (size_t i : IndicesOf(primary_results)) {
         results[i] = {primary_results[i]};
         if (primary_results[i].first != secondary_results[i].first) {
@@ -678,7 +686,7 @@ Status KMeansTreePartitioner<T>::TokensForDatapointWithSpillingBatched(
                database_spilling_fixed_number_of_centers_ == 0) {
       vector<pair<DatapointIndex, float>> primary_results;
       SCANN_RETURN_IF_ERROR(
-          TokenForDatapointBatched(queries, &primary_results));
+          TokenForDatapointBatched(queries, &primary_results, pool));
       for (size_t i : IndicesOf(primary_results)) {
         results[i] = {primary_results[i]};
       }
@@ -852,7 +860,7 @@ KMeansTreePartitioner<T>::CreateAsymmetricHashingSearcherForQueryTokenization(
   auto centers = std::make_unique<DenseDataset<float>>();
   original_centers.ConvertType(centers.get());
 
-  TF_ASSIGN_OR_RETURN(
+  SCANN_ASSIGN_OR_RETURN(
       query_tokenization_searcher_,
       internal::CreateRecommendedAsymmetricSearcher(
           std::move(centers), query_tokenization_dist_,
@@ -883,10 +891,10 @@ Status KMeansTreePartitioner<
   auto centers = std::make_unique<DenseDataset<float>>();
   original_centers.ConvertType(centers.get());
 
-  TF_ASSIGN_OR_RETURN(database_tokenization_searcher_,
-                      internal::CreateRecommendedAsymmetricSearcher(
-                          std::move(centers), database_tokenization_dist_, 1,
-                          numeric_limits<float>::infinity()));
+  SCANN_ASSIGN_OR_RETURN(database_tokenization_searcher_,
+                         internal::CreateRecommendedAsymmetricSearcher(
+                             std::move(centers), database_tokenization_dist_, 1,
+                             numeric_limits<float>::infinity()));
   return OkStatus();
 }
 
@@ -957,7 +965,7 @@ Status KMeansTreePartitioner<T>::OrthogonalityAmplifiedTokenForDatapointBatched(
       std::copy(dptr.values(), dptr.values() + dptr.dimensionality(),
                 result.begin() + (i - start) * queries.dimensionality());
     }
-    return DenseDataset<float>(result, end - start);
+    return DenseDataset<float>(std::move(result), end - start);
   };
 
   constexpr size_t kMaxBatchSize = 256;

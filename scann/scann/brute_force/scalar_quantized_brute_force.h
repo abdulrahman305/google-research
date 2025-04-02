@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "scann/base/search_parameters.h"
 #include "scann/base/single_machine_base.h"
 #include "scann/base/single_machine_factory_options.h"
@@ -66,19 +67,21 @@ class ScalarQuantizedBruteForceSearcher final
 
   ScalarQuantizedBruteForceSearcher(
       shared_ptr<const DistanceMeasure> distance,
-      vector<float> squared_l2_norms, DenseDataset<int8_t> quantized_dataset,
-      vector<float> inverse_multiplier_by_dimension,
+      shared_ptr<vector<float>> squared_l2_norms,
+      shared_ptr<const DenseDataset<int8_t>> quantized_dataset,
+      shared_ptr<const vector<float>> inverse_multiplier_by_dimension,
       int32_t default_num_neighbors, float default_epsilon);
 
   static StatusOr<vector<float>> ComputeSquaredL2NormsFromQuantizedDataset(
       const DenseDataset<int8_t>& quantized,
-      const vector<float>& inverse_multipliers);
+      absl::Span<const float> inverse_multipliers);
 
   static StatusOr<unique_ptr<ScalarQuantizedBruteForceSearcher>>
   CreateFromQuantizedDatasetAndInverseMultipliers(
       shared_ptr<const DistanceMeasure> distance,
-      DenseDataset<int8_t> quantized, vector<float> inverse_multipliers,
-      vector<float> squared_l2_norms, int32_t default_num_neighbors,
+      shared_ptr<const DenseDataset<int8_t>> quantized,
+      shared_ptr<const vector<float>> inverse_multipliers,
+      shared_ptr<vector<float>> squared_l2_norms, int32_t default_num_neighbors,
       float default_epsilon);
 
   static StatusOr<unique_ptr<ScalarQuantizedBruteForceSearcher>>
@@ -86,6 +89,10 @@ class ScalarQuantizedBruteForceSearcher final
                        shared_ptr<const DenseDataset<float>> dataset,
                        ConstSpan<float> abs_thresholds_for_each_dimension,
                        int32_t default_num_neighbors, float default_epsilon);
+
+  StatusOr<const SingleMachineSearcherBase<float>*> CreateBruteForceSearcher(
+      const DistanceMeasureConfig& distance_config,
+      unique_ptr<SingleMachineSearcherBase<float>>* storage) const final;
 
   class Mutator : public SingleMachineSearcherBase<float>::Mutator {
    public:
@@ -136,6 +143,14 @@ class ScalarQuantizedBruteForceSearcher final
   StatusOr<SingleMachineFactoryOptions> ExtractSingleMachineFactoryOptions()
       override;
 
+  ABSL_DEPRECATED("Use shared_ptr overload instead.")
+  static StatusOr<unique_ptr<ScalarQuantizedBruteForceSearcher>>
+  CreateFromQuantizedDatasetAndInverseMultipliers(
+      shared_ptr<const DistanceMeasure> distance,
+      DenseDataset<int8_t> quantized, vector<float> inverse_multipliers,
+      vector<float> squared_l2_norms, int32_t default_num_neighbors,
+      float default_epsilon);
+
  protected:
   Status FindNeighborsImpl(const DatapointPtr<float>& query,
                            const SearchParameters& params,
@@ -175,13 +190,13 @@ class ScalarQuantizedBruteForceSearcher final
 
   shared_ptr<const DistanceMeasure> distance_;
 
-  vector<float> squared_l2_norms_;
+  shared_ptr<vector<float>> squared_l2_norms_ = make_shared<vector<float>>();
 
-  DenseDataset<int8_t> quantized_dataset_;
+  shared_ptr<const DenseDataset<int8_t>> quantized_dataset_;
 
   Options opts_;
 
-  vector<float> inverse_multiplier_by_dimension_;
+  shared_ptr<const vector<float>> inverse_multiplier_by_dimension_;
 
   float min_distance_ = -numeric_limits<float>::infinity();
 

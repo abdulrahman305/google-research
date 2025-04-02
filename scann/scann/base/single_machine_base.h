@@ -19,10 +19,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
@@ -31,17 +33,18 @@
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
 #include "scann/data_format/docid_collection_interface.h"
-#include "scann/distance_measures/distance_measure_base.h"
 #include "scann/metadata/metadata_getter.h"
 #include "scann/oss_wrappers/scann_down_cast.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/oss_wrappers/scann_threadpool.h"
+#include "scann/proto/distance_measure.pb.h"
+#include "scann/proto/results.pb.h"
 #include "scann/proto/scann.pb.h"
 #include "scann/utils/common.h"
 #include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/reordering_helper_interface.h"
 #include "scann/utils/types.h"
 #include "scann/utils/util_functions.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -156,10 +159,14 @@ class UntypedSingleMachineSearcherBase {
 
   virtual vector<uint32_t> SizeByPartition() const;
 
+  virtual uint32_t NumPartitions() const { return 0; }
+
   class PrecomputedMutationArtifacts : public VirtualDestructor {};
 
   struct MutationOptions {
     PrecomputedMutationArtifacts* precomputed_mutation_artifacts = nullptr;
+
+    bool reassignment_in_flight = false;
   };
 
   class UntypedMutator {
@@ -390,6 +397,11 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
 
   void DisableExactReordering() { DisableReordering(); }
 
+  virtual StatusOr<const SingleMachineSearcherBase<T>*>
+  CreateBruteForceSearcher(
+      const DistanceMeasureConfig& distance_config,
+      unique_ptr<SingleMachineSearcherBase<T>>* storage) const;
+
   bool exact_reordering_enabled() const final {
     return exact_reordering_enabled_;
   }
@@ -429,6 +441,10 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
       mutation_threadpool_ = pool;
     }
 
+    virtual StatusOr<Datapoint<T>> GetDatapoint(DatapointIndex i) const {
+      return UnimplementedError("GetDatapoint not implemented.");
+    }
+
     virtual StatusOr<DatapointIndex> AddDatapoint(
         const DatapointPtr<T>& dptr, string_view docid,
         const MutationOptions& mo) = 0;
@@ -465,7 +481,14 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
       return std::nullopt;
     }
 
+    Status ValidateForAdd(const DatapointPtr<T>& dptr, string_view docid,
+                          const MutationOptions& mo) const;
+    Status ValidateForUpdate(const DatapointPtr<T>& dptr, DatapointIndex idx,
+                             const MutationOptions& mo) const;
+    Status ValidateForRemove(DatapointIndex idx) const;
+
    protected:
+    StatusOr<Datapoint<T>> GetDatapointFromBase(DatapointIndex i) const;
     StatusOr<DatapointIndex> AddDatapointToBase(const DatapointPtr<T>& dptr,
                                                 string_view docid,
                                                 const MutateBaseOptions& opts);
@@ -479,6 +502,10 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
     StatusOr<DatapointIndex> GetNextDatapointIndex() const;
 
     Status CheckAddDatapointToBaseOptions(const MutateBaseOptions& opts) const;
+
+    Status ValidateForUpdateOrAdd(const DatapointPtr<T>& dptr,
+                                  string_view docid,
+                                  const MutationOptions& mo) const;
 
     SingleMachineSearcherBase<T>* searcher_ = nullptr;
 
@@ -499,9 +526,38 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
   }
   StatusOr<typename UntypedSingleMachineSearcherBase::UntypedMutator*>
   GetUntypedMutator() const final {
-    TF_ASSIGN_OR_RETURN(auto mutator, GetMutator());
+    SCANN_ASSIGN_OR_RETURN(auto mutator, GetMutator());
     return mutator;
   }
+
+  struct HealthStats {
+    double partition_avg_relative_imbalance = 0;
+
+    double avg_quantization_error = 0;
+
+    uint64_t sum_partition_sizes = 0;
+
+    bool operator==(const HealthStats& rhs) const {
+      return partition_avg_relative_imbalance ==
+                 rhs.partition_avg_relative_imbalance &&
+             sum_partition_sizes == rhs.sum_partition_sizes &&
+
+             abs(avg_quantization_error - rhs.avg_quantization_error) < 1e-5;
+    }
+
+    template <typename Sink>
+    friend void AbslStringify(Sink& sink, const HealthStats& s) {
+      absl::Format(&sink,
+                   "{partition_avg_relative_imbalance = %f; "
+                   "avg_quantization_error = %f; sum_partition_sizes = %u}",
+                   s.partition_avg_relative_imbalance, s.avg_quantization_error,
+                   s.sum_partition_sizes);
+    }
+  };
+
+  virtual StatusOr<HealthStats> GetHealthStats() const { return HealthStats(); }
+
+  virtual Status InitializeHealthStats() { return OkStatus(); }
 
  protected:
   SingleMachineSearcherBase() {}
@@ -522,7 +578,7 @@ class SingleMachineSearcherBase : public UntypedSingleMachineSearcherBase {
   virtual Status FindNeighborsBatchedImpl(
       const TypedDataset<T>& queries, ConstSpan<SearchParameters> params,
       MutableSpan<FastTopNeighbors<float>*> results,
-      ConstSpan<DatapointIndex> datapoint_index_lookup) const;
+      ConstSpan<DatapointIndex> datapoint_index_mapping) const;
 
  private:
   Status PopulateDefaultParameters(const ScannConfig& config);

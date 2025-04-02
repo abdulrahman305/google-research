@@ -23,6 +23,7 @@
 #include "absl/random/distributions.h"
 #include "absl/status/status.h"
 #include "scann/data_format/datapoint.h"
+#include "scann/data_format/dataset.h"
 #include "scann/distance_measures/one_to_many/one_to_many.h"
 #include "scann/hashes/internal/asymmetric_hashing_postprocess.h"
 #include "scann/oss_wrappers/scann_random.h"
@@ -32,7 +33,6 @@
 #include "scann/utils/gmm_utils.h"
 #include "scann/utils/top_n_amortized_constant.h"
 #include "scann/utils/types.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 namespace asymmetric_hashing_internal {
@@ -49,8 +49,8 @@ StatusOr<vector<DenseDataset<double>>> AhImpl<T>::TrainAsymmetricHashing(
 
   SCANN_RET_CHECK(opts.projector());
   if (opts.preprocessing_function()) {
-    TF_ASSIGN_OR_RETURN(Datapoint<T> preprocessed,
-                        opts.preprocessing_function()(dataset[0]));
+    SCANN_ASSIGN_OR_RETURN(Datapoint<T> preprocessed,
+                           opts.preprocessing_function()(dataset[0]));
     SCANN_RETURN_IF_ERROR(
         opts.projector()->ProjectInput(preprocessed.ToPtr(), &chunked_vec));
   } else {
@@ -116,8 +116,8 @@ StatusOr<vector<DenseDataset<double>>> AhImpl<T>::TrainAsymmetricHashing(
   if (opts.preprocessing_function()) {
     for (DatapointIndex i : sample) {
       SCANN_RETURN_IF_ERROR(VerifyAllFinite(dataset[i].values_span()));
-      TF_ASSIGN_OR_RETURN(Datapoint<T> preprocessed,
-                          opts.preprocessing_function()(dataset[i]));
+      SCANN_ASSIGN_OR_RETURN(Datapoint<T> preprocessed,
+                             opts.preprocessing_function()(dataset[i]));
       SCANN_RETURN_IF_ERROR(VerifyAllFinite(preprocessed.values()));
       SCANN_RETURN_IF_ERROR(
           opts.projector()->ProjectInput(preprocessed.ToPtr(), &chunked_vec));
@@ -152,7 +152,7 @@ StatusOr<vector<DenseDataset<double>>> AhImpl<T>::TrainAsymmetricHashing(
     for (size_t center_idx : IndicesOf(centers)) {
       SCANN_RETURN_IF_ERROR(VerifyAllFinite(centers[center_idx].values_span()));
       if (!opts.config().use_norm_biasing_correction()) continue;
-      TF_ASSIGN_OR_RETURN(
+      SCANN_ASSIGN_OR_RETURN(
           const double norm_bias_correction,
           ComputeNormBiasCorrection(chunked_dataset[i], centers[center_idx],
                                     subpartitions[center_idx]));
@@ -168,10 +168,10 @@ StatusOr<vector<DenseDataset<double>>> AhImpl<T>::TrainAsymmetricHashing(
 
     vector<uint32_t> centers_permutation(centers.size());
     std::iota(centers_permutation.begin(), centers_permutation.end(), 0U);
-    std::sort(centers_permutation.begin(), centers_permutation.end(),
-              [&subpartitions](uint32_t a, uint32_t b) {
-                return subpartitions[a].size() > subpartitions[b].size();
-              });
+    std::stable_sort(centers_permutation.begin(), centers_permutation.end(),
+                     [&subpartitions](uint32_t a, uint32_t b) {
+                       return subpartitions[a].size() > subpartitions[b].size();
+                     });
 
     constexpr size_t kAssumedCacheLineSize = 64;
     constexpr size_t kFloatsPerCacheLine =
@@ -440,11 +440,12 @@ Status AhImpl<T>::IndexDatapointNoiseShaped(
   SCANN_RET_CHECK_EQ(result.size(), centers.size());
   SCANN_RET_CHECK_EQ(maybe_residual_dptr.dimensionality(),
                      original_dptr.dimensionality());
-  TF_ASSIGN_OR_RETURN(auto residual_stats,
-                      ComputeResidualStats(maybe_residual_dptr, original_dptr,
-                                           centers, projection));
-
   SCANN_RETURN_IF_ERROR(ValidateNoiseShapingParams(threshold, eta));
+  SCANN_ASSIGN_OR_RETURN(
+      auto residual_stats,
+      ComputeResidualStats(maybe_residual_dptr, original_dptr, centers,
+                           projection));
+
   const double parallel_cost_multiplier =
       std::isnan(eta) ? ComputeParallelCostMultiplier(
                             threshold, SquaredL2Norm(original_dptr),
@@ -663,36 +664,42 @@ vector<uint8_t> CreatePackedDataset(
   if (hashed_database.empty()) {
     return packed_dataset;
   }
+  const DatapointIndex data_size = hashed_database.size();
 
   DimensionIndex num_blocks = hashed_database[0].nonzero_entries();
-  packed_dataset.resize(num_blocks * ((hashed_database.size() + 31) & (~31)) /
+  packed_dataset.resize(num_blocks *
+                        ((data_size + kNumDatapointsPerBlock - 1) &
+                         (~(kNumDatapointsPerBlock - 1))) /
                         2);
   DatapointIndex k = 0;
-  for (; k < hashed_database.size() / 32; ++k) {
-    size_t start = k * 16 * num_blocks;
+  for (; k < data_size / kNumDatapointsPerBlock; ++k) {
+    size_t start = k * kPackedDatasetBlockSize * num_blocks;
     for (size_t j = 0; j < num_blocks; ++j) {
-      for (size_t m = 0; m < 16; m++) {
-        uint8_t u0 = hashed_database[k * 32 + m].values()[j];
-        uint8_t u1 = hashed_database[k * 32 + m + 16].values()[j];
-        packed_dataset[start + j * 16 + m] = u1 * 16 + u0;
+      for (size_t m = 0; m < kPackedDatasetBlockSize; m++) {
+        uint8_t u0 =
+            hashed_database[k * kNumDatapointsPerBlock + m].values()[j];
+        uint8_t u1 = hashed_database[k * kNumDatapointsPerBlock + m +
+                                     kPackedDatasetBlockSize]
+                         .values()[j];
+        packed_dataset[start + j * kPackedDatasetBlockSize + m] =
+            u1 * kPackedDatasetBlockSize + u0;
       }
     }
   }
 
-  if (k * 32 < hashed_database.size()) {
-    size_t start = k * 16 * num_blocks;
+  if (k * kNumDatapointsPerBlock < data_size) {
+    size_t start = k * kPackedDatasetBlockSize * num_blocks;
     for (size_t j = 0; j < num_blocks; ++j) {
-      for (size_t m = 0; m < 16; m++) {
-        DatapointIndex dp_idx = k * 32 + m;
-        dp_idx = dp_idx >= hashed_database.size() ? (hashed_database.size() - 1)
-                                                  : dp_idx;
+      for (size_t m = 0; m < kPackedDatasetBlockSize; m++) {
+        DatapointIndex dp_idx = k * kNumDatapointsPerBlock + m;
+        dp_idx = dp_idx >= data_size ? (data_size - 1) : dp_idx;
         uint8_t u0 = hashed_database[dp_idx].values()[j];
 
-        dp_idx = k * 32 + m + 16;
-        dp_idx = dp_idx >= hashed_database.size() ? (hashed_database.size() - 1)
-                                                  : dp_idx;
+        dp_idx = k * kNumDatapointsPerBlock + m + kPackedDatasetBlockSize;
+        dp_idx = dp_idx >= data_size ? (data_size - 1) : dp_idx;
         uint8_t u1 = hashed_database[dp_idx].values()[j];
-        packed_dataset[start + j * 16 + m] = u1 * 16 + u0;
+        packed_dataset[start + j * kPackedDatasetBlockSize + m] =
+            u1 * kPackedDatasetBlockSize + u0;
       }
     }
   }

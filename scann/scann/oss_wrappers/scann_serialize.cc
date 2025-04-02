@@ -15,10 +15,12 @@
 #include "scann/oss_wrappers/scann_serialize.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "absl/base/casts.h"
 #include "absl/base/internal/endian.h"
+#include "absl/strings/string_view.h"
 
 namespace research_scann {
 namespace strings {

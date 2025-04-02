@@ -25,9 +25,10 @@
 #include "scann/base/restrict_allowlist.h"
 #include "scann/base/search_parameters.h"
 #include "scann/base/single_machine_base.h"
-#include "scann/distance_measures/many_to_many/many_to_many.h"
+#include "scann/distance_measures/many_to_many/many_to_many_floating_point.h"
 #include "scann/distance_measures/one_to_many/one_to_many.h"
 #include "scann/oss_wrappers/scann_down_cast.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/utils/common.h"
 #include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/intrinsics/sse4.h"
@@ -425,8 +426,10 @@ Status BruteForceSearcher<T>::FindNeighborsImpl(const DatapointPtr<T>& query,
     return FailedPreconditionError("Crowding is not supported.");
   } else {
     TopNeighbors<float> top_n(params.pre_reordering_num_neighbors());
-    use_min_distance ? FindNeighborsInternal<true>(query, params, &top_n)
-                     : FindNeighborsInternal<false>(query, params, &top_n);
+    Status internal_status =
+        use_min_distance ? FindNeighborsInternal<true>(query, params, &top_n)
+                         : FindNeighborsInternal<false>(query, params, &top_n);
+    SCANN_RETURN_IF_ERROR(internal_status);
     *result = top_n.TakeUnsorted();
   }
   return OkStatus();
@@ -434,7 +437,7 @@ Status BruteForceSearcher<T>::FindNeighborsImpl(const DatapointPtr<T>& query,
 
 template <typename T>
 template <bool kUseMinDistance, typename TopN>
-void BruteForceSearcher<T>::FindNeighborsInternal(
+Status BruteForceSearcher<T>::FindNeighborsInternal(
     const DatapointPtr<T>& query, const SearchParameters& params,
     TopN* top_n_ptr) const {
   DCHECK(top_n_ptr);
@@ -483,6 +486,7 @@ void BruteForceSearcher<T>::FindNeighborsInternal(
     FindNeighborsOneToOneInternal<kUseMinDistance>(query, params, &it,
                                                    top_n_ptr);
   }
+  return OkStatus();
 }
 
 template <typename T>
@@ -560,8 +564,8 @@ BruteForceSearcher<T>::GetMutator() const {
   }
   if (!mutator_) {
     auto mutable_this = const_cast<BruteForceSearcher<T>*>(this);
-    TF_ASSIGN_OR_RETURN(mutator_,
-                        BruteForceSearcher<T>::Mutator::Create(mutable_this));
+    SCANN_ASSIGN_OR_RETURN(
+        mutator_, BruteForceSearcher<T>::Mutator::Create(mutable_this));
     SCANN_RETURN_IF_ERROR(mutator_->PrepareForBaseMutation(mutable_this));
   }
   return static_cast<typename SingleMachineSearcherBase<T>::Mutator*>(

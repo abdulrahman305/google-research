@@ -50,7 +50,7 @@ class ScannNumpy {
   SearchBatched(const np_row_major_arr<float>& queries, int final_nn,
                 int pre_reorder_nn, int leaves, bool parallel = false,
                 int batch_size = 256);
-  void Serialize(std::string path);
+  void Serialize(std::string path, bool relative_path = false);
 
   vector<DatapointIndex> Upsert(
       std::vector<std::optional<DatapointIndex>> indices,
@@ -69,6 +69,9 @@ class ScannNumpy {
                                  DimensionIndex dim);
 
   string Config();
+
+  pybind11::dict GetHealthStats() const;
+  void InitializeHealthStats();
 
  private:
   ScannInterface scann_;

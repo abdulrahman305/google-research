@@ -16,6 +16,12 @@
 
 #include <cstdint>
 
+#include "absl/log/check.h"
+#include "scann/data_format/datapoint.h"
+#include "scann/data_format/dataset.h"
+#include "scann/distance_measures/one_to_many/one_to_many_helpers.h"
+#include "scann/distance_measures/one_to_many/scale_encoding.pb.h"
+#include "scann/utils/common.h"
 #include "scann/utils/types.h"
 
 namespace research_scann {
@@ -127,6 +133,55 @@ void OneToManyBf16FloatSquaredL2(const DatapointPtr<float>& query,
   one_to_many_low_level::OneToManyBf16FloatDispatch<true, true>(
       query.values(), database, indices.data(), result,
       one_to_many_low_level::SetDistanceFunctor<float>(result));
+}
+
+namespace {
+
+class Int4DenseDatasetView {
+ public:
+  Int4DenseDatasetView(const uint8_t* ptr, size_t dims,
+                       ScaleEncoding scale_encoding)
+      : ptr_(ptr),
+        dims_(dims),
+        stride_(one_to_many_low_level::DatapointBytes<uint8_t>(
+            dims, scale_encoding)) {}
+
+  SCANN_INLINE const uint8_t* GetPtr(size_t i) const {
+    return ptr_ + i * stride_;
+  }
+
+  SCANN_INLINE size_t dimensionality() const { return dims_; }
+
+ private:
+  const uint8_t* ptr_;
+  size_t dims_;
+  size_t stride_;
+};
+
+}  // namespace
+
+void DenseDotProductDistanceOneToManyUint4Int8(
+    const DatapointPtr<int8_t>& query, const uint8_t* dataset,
+    ConstSpan<DatapointIndex> indices, MutableSpan<int32_t> result) {
+  DCHECK_EQ(indices.size(), result.size());
+  using one_to_many_low_level::SetDistanceFunctor;
+  one_to_many_low_level::OneToManyUint4Int8Dispatch<true>(
+      query.values(),
+      Int4DenseDatasetView(dataset, query.dimensionality(),
+                           UNSPECIFIED_SCALE_ENCODING),
+      indices.data(), result, SetDistanceFunctor<int32_t>(result));
+}
+
+void DenseDotProductDistanceOneToManyScaledUint4Float(
+    ScaleEncoding scale_encoding, const DatapointPtr<float>& query,
+    const uint8_t* dataset, ConstSpan<DatapointIndex> indices,
+    MutableSpan<float> result) {
+  DCHECK_EQ(indices.size(), result.size());
+  using one_to_many_low_level::SetDistanceFunctor;
+  one_to_many_low_level::OneToManyScaledUint4FloatDispatch<true>(
+      scale_encoding, query.values(),
+      Int4DenseDatasetView(dataset, query.dimensionality(), scale_encoding),
+      indices.data(), result, SetDistanceFunctor<float>(result));
 }
 
 }  // namespace research_scann

@@ -14,6 +14,10 @@
 
 #include "scann/tree_x_hybrid/internal/utils.h"
 
+#include "absl/container/btree_map.h"
+#include "absl/flags/flag.h"
+#include "absl/types/span.h"
+
 #ifdef __x86_64__
 #include <x86intrin.h>
 #endif
@@ -55,7 +59,7 @@ SCANN_AVX2_OUTLINE size_t Avx2GatherCreateLeafLocalAllowlist(
 #endif
 
 StatusOr<bool> ValidateDatapointsByToken(
-    const vector<std::vector<DatapointIndex>>& datapoints_by_token,
+    absl::Span<const std::vector<DatapointIndex>> datapoints_by_token,
     DatapointIndex num_datapoints) {
   bool is_disjoint = true;
 
@@ -120,12 +124,21 @@ vector<uint32_t> SizeByPartition(
   return result;
 }
 
+template <typename Container>
+void MaybeReserve(Container& c, size_t s) {}
+
+template <>
+void MaybeReserve(flat_hash_map<DatapointIndex, float>& c, size_t s) {
+  c.reserve(s);
+}
+
+template <typename Container>
 void DeduplicateDatabaseSpilledResults(NNResultsVector* results,
                                        size_t final_size) {
   DCHECK_GT(final_size, 0);
   DCHECK_LE(results->size() / 2, final_size);
-  flat_hash_map<DatapointIndex, float> map;
-  map.reserve(results->size());
+  Container map;
+  MaybeReserve(map, results->size());
   for (const auto& neighbor : *results) {
     auto [it, was_inserted] = map.insert(neighbor);
     if (!was_inserted) {
@@ -140,6 +153,12 @@ void DeduplicateDatabaseSpilledResults(NNResultsVector* results,
                               DistanceComparatorBranchOptimized());
     results->resize(final_size);
   }
+}
+
+void DeduplicateDatabaseSpilledResults(NNResultsVector* results,
+                                       size_t final_size) {
+  DeduplicateDatabaseSpilledResults<flat_hash_map<DatapointIndex, float>>(
+      results, final_size);
 }
 
 }  // namespace research_scann

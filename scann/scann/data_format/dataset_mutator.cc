@@ -12,17 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "absl/status/status.h"
+#include <algorithm>
+
 #include "absl/strings/substitute.h"
+#include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
+#include "scann/utils/common.h"
 #include "scann/utils/datapoint_utils.h"
+#include "scann/utils/types.h"
 
 namespace research_scann {
 
 template <typename T>
 StatusOr<unique_ptr<typename DenseDataset<T>::Mutator>>
 DenseDataset<T>::Mutator::Create(DenseDataset<T>* dataset) {
-  TF_ASSIGN_OR_RETURN(auto mutator, dataset->docids()->GetMutator());
+  SCANN_ASSIGN_OR_RETURN(auto mutator, dataset->docids()->GetMutator());
   return make_unique<Mutator>(Mutator(dataset, mutator));
 }
 
@@ -58,7 +62,7 @@ Status DenseDataset<T>::Mutator::RemoveDatapoint(DatapointIndex index) {
       dataset_->data_.begin() + index * dataset_->stride_);
   dataset_->data_.resize((dataset_->size() - 1) * dataset_->stride_);
 
-  TF_CHECK_OK(docid_mutator_->RemoveDatapoint(index));
+  CHECK_OK(docid_mutator_->RemoveDatapoint(index));
   return OkStatus();
 }
 
@@ -97,6 +101,21 @@ Status DenseDataset<T>::Mutator::UpdateDatapoint(const DatapointPtr<T>& dptr,
   std::copy(dp.values().begin(), dp.values().end(),
             dataset_->data_.begin() + index * dataset_->stride_);
   return OkStatus();
+}
+
+template <typename T>
+StatusOr<Datapoint<T>> DenseDataset<T>::Mutator::GetDatapoint(
+    DatapointIndex index) const {
+  if (index >= dataset_->size()) {
+    return OutOfRangeError(
+        "Datapoint index out of bound: index = %d, but size = %d.", index,
+        dataset_->size());
+  }
+
+  auto dptr = dataset_->at(index);
+  Datapoint<T> dp;
+  CopyToDatapoint(dptr, &dp);
+  return dp;
 }
 
 SCANN_INSTANTIATE_TYPED_CLASS(, DenseDataset);

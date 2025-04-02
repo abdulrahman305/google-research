@@ -25,18 +25,24 @@
 
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "scann/base/single_machine_factory_options.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
 #include "scann/distance_measures/distance_measures.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/utils/common.h"
 #include "scann/utils/fixed_point/pre_quantized_fixed_point.h"
 #include "scann/utils/reordering_helper_interface.h"
 #include "scann/utils/types.h"
 #include "scann/utils/util_functions.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
+
+class FixedPointFloatDenseCosineReorderingHelper;
+
+template <typename T>
+class SingleMachineSearcherBase;
 
 template <typename T>
 class ExactReorderingHelper : public ReorderingHelper<T> {
@@ -62,6 +68,9 @@ class ExactReorderingHelper : public ReorderingHelper<T> {
   absl::StatusOr<std::pair<DatapointIndex, float>>
   ComputeTop1ReorderingDistance(const DatapointPtr<T>& query,
                                 NNResultsVector* result) const override;
+
+  StatusOrPtr<SingleMachineSearcherBase<T>> CreateBruteForceSearcher(
+      int32_t num_neighbors, float epsilon) const final;
 
   bool owns_mutation_data_structures() const override { return false; }
 
@@ -91,7 +100,7 @@ class FixedPointFloatDenseDotProductReorderingHelper
 
   explicit FixedPointFloatDenseDotProductReorderingHelper(
       shared_ptr<DenseDataset<int8_t>> fixed_point_dataset,
-      const std::vector<float>& multiplier_by_dimension,
+      absl::Span<const float> multiplier_by_dimension,
       float noise_shaping_threshold = NAN);
 
   ~FixedPointFloatDenseDotProductReorderingHelper() override;
@@ -104,6 +113,9 @@ class FixedPointFloatDenseDotProductReorderingHelper
 
   Status ComputeDistancesForReordering(const DatapointPtr<float>& query,
                                        NNResultsVector* result) const override;
+
+  StatusOrPtr<SingleMachineSearcherBase<float>> CreateBruteForceSearcher(
+      int32_t num_neighbors, float epsilon) const final;
 
   template <typename CallbackFunctor>
   Status ComputeDistancesForReordering(
@@ -131,16 +143,17 @@ class FixedPointFloatDenseDotProductReorderingHelper
       SingleMachineFactoryOptions* opts) const override {
     opts->pre_quantized_fixed_point =
         make_shared<PreQuantizedFixedPoint>(CreatePreQuantizedFixedPoint(
-            *fixed_point_dataset_, inverse_multipliers_, {}, true));
+            *fixed_point_dataset_, *inverse_multipliers_, {}, true));
   }
 
  private:
   shared_ptr<DenseDataset<int8_t>> fixed_point_dataset_;
-  std::vector<float> inverse_multipliers_;
+  shared_ptr<const vector<float>> inverse_multipliers_;
   const float noise_shaping_threshold_ = NAN;
   mutable unique_ptr<Mutator> mutator_;
 
   friend class FixedPointFloatDenseSquaredL2ReorderingHelper;
+  friend class FixedPointFloatDenseCosineReorderingHelper;
 };
 
 class FixedPointFloatDenseCosineReorderingHelper
@@ -153,7 +166,7 @@ class FixedPointFloatDenseCosineReorderingHelper
 
   explicit FixedPointFloatDenseCosineReorderingHelper(
       shared_ptr<DenseDataset<int8_t>> fixed_point_dataset,
-      const std::vector<float>& multiplier_by_dimension,
+      absl::Span<const float> multiplier_by_dimension,
       float noise_shaping_threshold = NAN);
 
   ~FixedPointFloatDenseCosineReorderingHelper() override;
@@ -163,6 +176,9 @@ class FixedPointFloatDenseCosineReorderingHelper
   }
 
   bool needs_dataset() const override { return false; }
+
+  StatusOrPtr<SingleMachineSearcherBase<float>> CreateBruteForceSearcher(
+      int32_t num_neighbors, float epsilon) const final;
 
   Status ComputeDistancesForReordering(const DatapointPtr<float>& query,
                                        NNResultsVector* result) const override;
@@ -203,7 +219,7 @@ class FixedPointFloatDenseSquaredL2ReorderingHelper
 
   FixedPointFloatDenseSquaredL2ReorderingHelper(
       shared_ptr<DenseDataset<int8_t>> fixed_point_dataset,
-      const std::vector<float>& multiplier_by_dimension,
+      absl::Span<const float> multiplier_by_dimension,
       shared_ptr<const std::vector<float>> squared_l2_norm_by_datapoint);
 
   std::string name() const override {
@@ -211,6 +227,9 @@ class FixedPointFloatDenseSquaredL2ReorderingHelper
   }
 
   bool needs_dataset() const override { return false; }
+
+  StatusOrPtr<SingleMachineSearcherBase<float>> CreateBruteForceSearcher(
+      int32_t num_neighbors, float epsilon) const final;
 
   Status ComputeDistancesForReordering(const DatapointPtr<float>& query,
                                        NNResultsVector* result) const override;
@@ -301,6 +320,9 @@ class Bfloat16ReorderingHelper : public ReorderingHelper<float> {
   }
 
   bool needs_dataset() const override { return false; }
+
+  StatusOrPtr<SingleMachineSearcherBase<float>> CreateBruteForceSearcher(
+      int32_t num_neighbors, float epsilon) const final;
 
   Status ComputeDistancesForReordering(const DatapointPtr<float>& query,
                                        NNResultsVector* result) const override;

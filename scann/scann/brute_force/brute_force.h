@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "scann/base/search_parameters.h"
@@ -26,6 +27,9 @@
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
 #include "scann/distance_measures/distance_measure_base.h"
+#include "scann/oss_wrappers/scann_threadpool.h"
+#include "scann/utils/common.h"
+#include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/types.h"
 
 namespace research_scann {
@@ -38,7 +42,7 @@ class BruteForceSearcher final : public SingleMachineSearcherBase<T> {
                      const int32_t default_pre_reordering_num_neighbors,
                      const float default_pre_reordering_epsilon);
 
-  ~BruteForceSearcher() override;
+  ~BruteForceSearcher() final;
 
   bool supports_crowding() const final { return true; }
 
@@ -49,6 +53,12 @@ class BruteForceSearcher final : public SingleMachineSearcherBase<T> {
   void set_thread_pool(std::shared_ptr<ThreadPool> p) { pool_ = std::move(p); }
 
   void set_min_distance(float min_distance) { min_distance_ = min_distance; }
+
+  StatusOr<const SingleMachineSearcherBase<T>*> CreateBruteForceSearcher(
+      const DistanceMeasureConfig&,
+      unique_ptr<SingleMachineSearcherBase<T>>* storage) const final {
+    return this;
+  }
 
   using PrecomputedMutationArtifacts =
       UntypedSingleMachineSearcherBase::PrecomputedMutationArtifacts;
@@ -64,6 +74,7 @@ class BruteForceSearcher final : public SingleMachineSearcherBase<T> {
     Mutator(const Mutator&) = delete;
     Mutator& operator=(const Mutator&) = delete;
     ~Mutator() final {}
+    absl::StatusOr<Datapoint<T>> GetDatapoint(DatapointIndex i) const final;
     StatusOr<DatapointIndex> AddDatapoint(const DatapointPtr<T>& dptr,
                                           string_view docid,
                                           const MutationOptions& mo) final;
@@ -110,9 +121,9 @@ class BruteForceSearcher final : public SingleMachineSearcherBase<T> {
 
  private:
   template <bool kUseMinDistance, typename TopN>
-  void FindNeighborsInternal(const DatapointPtr<T>& query,
-                             const SearchParameters& params,
-                             TopN* top_n_ptr) const;
+  Status FindNeighborsInternal(const DatapointPtr<T>& query,
+                               const SearchParameters& params,
+                               TopN* top_n_ptr) const;
 
   template <bool kUseMinDistance, typename WhitelistIterator, typename TopN>
   void FindNeighborsOneToOneInternal(const DatapointPtr<T>& query,

@@ -6,7 +6,7 @@ load("//build_deps/tf_dependency:tf_configure.bzl", "tf_configure")
 # Needed for highway's config_setting_group
 http_archive(
     name = "bazel_skylib",
-    urls = ["https://github.com/bazelbuild/bazel-skylib/releases/download/1.3.0/bazel-skylib-1.3.0.tar.gz"],
+    urls = ["https://github.com/bazelbuild/bazel-skylib/releases/download/1.7.1/bazel-skylib-1.7.1.tar.gz"],
 )
 
 load("@bazel_skylib//:workspace.bzl", "bazel_skylib_workspace")
@@ -15,10 +15,10 @@ bazel_skylib_workspace()
 
 http_archive(
     name = "platforms",
-    sha256 = "5308fc1d8865406a49427ba24a9ab53087f17f5266a7aabbfc28823f3916e1ca",
+    sha256 = "218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/platforms/releases/download/0.0.6/platforms-0.0.6.tar.gz",
-        "https://github.com/bazelbuild/platforms/releases/download/0.0.6/platforms-0.0.6.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
+        "https://github.com/bazelbuild/platforms/releases/download/0.0.10/platforms-0.0.10.tar.gz",
     ],
 )
 
@@ -37,9 +37,9 @@ git_repository(
 http_archive(
     name = "pybind11",
     build_file = "@pybind11_bazel//:pybind11.BUILD",
-    strip_prefix = "pybind11-2.11.1",
+    strip_prefix = "pybind11-2.13.6",
     urls = [
-        "https://github.com/pybind/pybind11/archive/v2.11.1.tar.gz",
+        "https://github.com/pybind/pybind11/archive/v2.13.6.tar.gz",
     ],
 )
 
@@ -100,13 +100,17 @@ bind(
 git_repository(
     name = "com_google_googletest",
     remote = "https://github.com/google/googletest.git",
-    tag = "release-1.10.0",
+    tag = "v1.14.0",
 )
+
+load("@com_google_googletest//:googletest_deps.bzl", "googletest_deps")
+
+googletest_deps()
 
 git_repository(
     name = "com_google_highway",
     remote = "https://github.com/google/highway.git",
-    tag = "1.0.1",
+    tag = "1.2.0",
 )
 
 git_repository(
@@ -128,3 +132,10 @@ http_archive(
 load("@rules_cc//cc:repositories.bzl", "rules_cc_dependencies")
 
 rules_cc_dependencies()
+
+git_repository(
+    name = "eigen",
+    commit = "33d0937c6bdf5ec999939fb17f2a553183d14a74",
+    remote = "https://gitlab.com/libeigen/eigen.git",
+    build_file = "//build_deps/eigen:eigen.BUILD",
+)

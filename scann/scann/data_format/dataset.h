@@ -20,11 +20,14 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
+#include "absl/base/prefetch.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/docid_collection.h"
+#include "scann/data_format/docid_collection_interface.h"
 #include "scann/data_format/features.pb.h"
 #include "scann/data_format/sparse_low_level.h"
 #include "scann/distance_measures/distance_measure_base.h"
@@ -33,7 +36,6 @@
 #include "scann/utils/iterators.h"
 #include "scann/utils/types.h"
 #include "scann/utils/util_functions.h"
-#include "tensorflow/core/platform/prefetch.h"
 
 namespace research_scann {
 
@@ -194,7 +196,7 @@ class TypedDataset : public Dataset {
  public:
   SCANN_DECLARE_MOVE_ONLY_CLASS(TypedDataset);
 
-  TypedDataset() {}
+  TypedDataset() = default;
 
   explicit TypedDataset(unique_ptr<DocidCollectionInterface> docids)
       : Dataset(std::move(docids)) {}
@@ -241,7 +243,7 @@ class TypedDataset : public Dataset {
   class Mutator;
   virtual StatusOr<typename TypedDataset::Mutator*> GetMutator() const = 0;
   StatusOr<typename Dataset::Mutator*> GetUntypedMutator() const override {
-    TF_ASSIGN_OR_RETURN(Dataset::Mutator * result, GetMutator());
+    SCANN_ASSIGN_OR_RETURN(Dataset::Mutator * result, GetMutator());
     return result;
   }
 };
@@ -249,6 +251,8 @@ class TypedDataset : public Dataset {
 template <typename T>
 class TypedDataset<T>::Mutator : public Dataset::Mutator {
  public:
+  virtual StatusOr<Datapoint<T>> GetDatapoint(DatapointIndex index) const = 0;
+
   virtual Status AddDatapoint(const DatapointPtr<T>& dptr,
                               string_view docid) = 0;
 
@@ -280,7 +284,7 @@ class DenseDataset final : public TypedDataset<T> {
   DenseDataset(std::vector<T> datapoint_vec,
                unique_ptr<DocidCollectionInterface> docids);
 
-  DenseDataset(std::vector<T> datapoint_vec, size_t num_dp);
+  DenseDataset(std::vector<T>&& datapoint_vec, size_t num_dp);
 
   DenseDataset<T> Copy() const {
     auto result = DenseDataset<T>(data_, this->docids()->Copy());
@@ -359,6 +363,8 @@ class DenseDataset final : public TypedDataset<T> {
 
     ~Mutator() final {}
 
+    StatusOr<Datapoint<T>> GetDatapoint(DatapointIndex index) const final;
+
     Status AddDatapoint(const DatapointPtr<T>& dptr, string_view docid) final;
 
     Status RemoveDatapoint(string_view docid) final;
@@ -408,6 +414,10 @@ class DenseDatasetView : VirtualDestructor {
   DenseDatasetView() = default;
 
   virtual const T* GetPtr(size_t i) const = 0;
+
+  SCANN_INLINE ConstSpan<T> GetDatapointSpan(size_t i) const {
+    return MakeConstSpan(GetPtr(i), dimensionality());
+  }
 
   virtual size_t dimensionality() const = 0;
 
@@ -539,6 +549,57 @@ class RandomDatapointsSubView : public DenseDatasetView<T> {
 };
 
 template <typename T>
+class StridedDatasetView final : public DenseDatasetView<T> {
+ public:
+  StridedDatasetView(const T* ptr, size_t dimension, size_t stride, size_t size)
+      : ptr_(ptr), dims_(dimension), stride_(stride), size_(size) {}
+
+  SCANN_INLINE const T* GetPtr(size_t i) const final {
+    return ptr_ + i * stride_;
+  }
+
+  SCANN_INLINE size_t dimensionality() const final { return dims_; }
+
+  SCANN_INLINE size_t size() const final { return size_; }
+
+  std::unique_ptr<DenseDatasetView<T>> subview(size_t offset,
+                                               size_t size) const final {
+    CHECK_LE(offset + size, size_);
+    return absl::WrapUnique(new StridedDatasetView<T>(ptr_ + offset * stride_,
+                                                      dims_, stride_, size));
+  }
+
+ private:
+  const T* __restrict__ ptr_ = nullptr;
+  size_t dims_ = 0;
+  size_t stride_ = 0;
+  size_t size_ = 0;
+};
+
+template <typename T>
+class SpanDenseDatasetView final : public DenseDatasetView<T> {
+ public:
+  SpanDenseDatasetView(ConstSpan<T> span, size_t dimension)
+      : ptr_(span.data()),
+        dimension_(dimension),
+        size_(span.size() / dimension) {
+    CHECK_EQ(span.size() % dimension, 0);
+  }
+
+  SCANN_INLINE const T* GetPtr(size_t i) const override {
+    return ptr_ + i * dimension_;
+  }
+  SCANN_INLINE size_t dimensionality() const override { return dimension_; }
+  SCANN_INLINE size_t size() const override { return size_; }
+  SCANN_INLINE bool IsConsecutiveStorage() const override { return true; }
+
+ private:
+  const T* __restrict__ ptr_ = nullptr;
+  uint32_t dimension_;
+  uint32_t size_;
+};
+
+template <typename T>
 class SparseDataset final : public TypedDataset<T> {
  public:
   SCANN_DECLARE_MOVE_ONLY_CLASS(SparseDataset);
@@ -628,7 +689,7 @@ DatapointPtr<T> DenseDataset<T>::operator[](size_t i) const {
 template <typename T>
 void DenseDataset<T>::Prefetch(size_t i) const {
   DCHECK_LT(i, this->size());
-  ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_NTA>(
+  absl::PrefetchToLocalCacheNta(
       reinterpret_cast<const char*>(data_.data() + i * stride_));
 }
 

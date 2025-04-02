@@ -24,6 +24,7 @@
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
 #include "scann/base/search_parameters.h"
 #include "scann/base/single_machine_base.h"
 #include "scann/base/single_machine_factory_options.h"
@@ -33,13 +34,13 @@
 #include "scann/distance_measures/one_to_many/one_to_many.h"
 #include "scann/distance_measures/one_to_one/dot_product.h"
 #include "scann/distance_measures/one_to_one/l2_distance.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/utils/common.h"
 #include "scann/utils/datapoint_utils.h"
 #include "scann/utils/fast_top_neighbors.h"
 #include "scann/utils/fixed_point/pre_quantized_fixed_point.h"
 #include "scann/utils/scalar_quantization_helpers.h"
 #include "scann/utils/types.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -68,26 +69,30 @@ ScalarQuantizedBruteForceSearcher::ScalarQuantizedBruteForceSearcher(
       opts_(opts) {
   ScalarQuantizationResults quantization_results = ScalarQuantizeFloatDataset(
       *dataset, opts.multiplier_quantile, opts.noise_shaping_threshold);
-  quantized_dataset_ = std::move(quantization_results.quantized_dataset);
-  inverse_multiplier_by_dimension_ =
-      std::move(quantization_results.inverse_multiplier_by_dimension);
+  quantized_dataset_ = make_shared<DenseDataset<int8_t>>(
+      std::move(quantization_results.quantized_dataset));
+  inverse_multiplier_by_dimension_ = make_shared<vector<float>>(
+      std::move(quantization_results.inverse_multiplier_by_dimension));
   const auto distance_tag = distance->specially_optimized_distance_tag();
   auto distance_tag_status = CheckValidDistanceTag(distance_tag);
   if (!distance_tag_status.ok()) {
     LOG(FATAL) << distance_tag_status;
   }
+
   if (distance_tag == DistanceMeasure::SQUARED_L2) {
-    squared_l2_norms_.resize(dataset->size());
+    vector<float> squared_l2_norms(dataset->size());
     for (DatapointIndex i = 0; i < dataset->size(); ++i) {
-      squared_l2_norms_[i] = SquaredL2Norm((*dataset)[i]);
+      squared_l2_norms[i] = SquaredL2Norm((*dataset)[i]);
     }
+    squared_l2_norms_ = make_shared<vector<float>>(std::move(squared_l2_norms));
   }
 }
 
 ScalarQuantizedBruteForceSearcher::ScalarQuantizedBruteForceSearcher(
-    shared_ptr<const DistanceMeasure> distance, vector<float> squared_l2_norms,
-    DenseDataset<int8_t> quantized_dataset,
-    vector<float> inverse_multiplier_by_dimension,
+    shared_ptr<const DistanceMeasure> distance,
+    shared_ptr<vector<float>> squared_l2_norms,
+    shared_ptr<const DenseDataset<int8_t>> quantized_dataset,
+    shared_ptr<const vector<float>> inverse_multiplier_by_dimension,
     int32_t default_num_neighbors, float default_epsilon)
     : SingleMachineSearcherBase<float>(nullptr, default_num_neighbors,
                                        default_epsilon),
@@ -96,13 +101,13 @@ ScalarQuantizedBruteForceSearcher::ScalarQuantizedBruteForceSearcher(
       quantized_dataset_(std::move(quantized_dataset)),
       inverse_multiplier_by_dimension_(
           std::move(inverse_multiplier_by_dimension)) {
-  TF_CHECK_OK(this->set_docids(quantized_dataset_.ReleaseDocids()));
+  QCHECK_OK(this->set_docids(quantized_dataset_->docids()));
 }
 
 StatusOr<vector<float>>
 ScalarQuantizedBruteForceSearcher::ComputeSquaredL2NormsFromQuantizedDataset(
     const DenseDataset<int8_t>& quantized,
-    const vector<float>& inverse_multipliers) {
+    absl::Span<const float> inverse_multipliers) {
   if (quantized.dimensionality() != inverse_multipliers.size())
     return InvalidArgumentError(absl::StrCat(
         "The dimension of quantized dataset ", quantized.dimensionality(),
@@ -125,18 +130,21 @@ StatusOr<unique_ptr<ScalarQuantizedBruteForceSearcher>>
 ScalarQuantizedBruteForceSearcher::
     CreateFromQuantizedDatasetAndInverseMultipliers(
         shared_ptr<const DistanceMeasure> distance,
-        DenseDataset<int8_t> quantized, vector<float> inverse_multipliers,
-        vector<float> squared_l2_norms, int32_t default_num_neighbors,
-        float default_epsilon) {
+        shared_ptr<const DenseDataset<int8_t>> quantized,
+        shared_ptr<const vector<float>> inverse_multipliers,
+        shared_ptr<vector<float>> squared_l2_norms,
+        int32_t default_num_neighbors, float default_epsilon) {
   const auto distance_tag = distance->specially_optimized_distance_tag();
   SCANN_RETURN_IF_ERROR(CheckValidDistanceTag(distance_tag));
-  if (distance_tag == DistanceMeasure::SQUARED_L2 && !quantized.empty() &&
-      squared_l2_norms.empty()) {
+  if (distance_tag == DistanceMeasure::SQUARED_L2 && !quantized->empty() &&
+      (!squared_l2_norms || squared_l2_norms->empty())) {
     LOG_FIRST_N(INFO, 1)
         << "squared_l2_norms are not loaded, and they will be computed.";
-    TF_ASSIGN_OR_RETURN(squared_l2_norms,
-                        ComputeSquaredL2NormsFromQuantizedDataset(
-                            quantized, inverse_multipliers));
+    SCANN_ASSIGN_OR_RETURN(auto squared_l2_norms_vec,
+                           ComputeSquaredL2NormsFromQuantizedDataset(
+                               *quantized, *inverse_multipliers));
+    squared_l2_norms =
+        make_shared<vector<float>>(std::move(squared_l2_norms_vec));
   }
 
   return std::make_unique<ScalarQuantizedBruteForceSearcher>(
@@ -168,7 +176,7 @@ ScalarQuantizedBruteForceSearcher::CreateWithFixedRange(
 
   vector<float> squared_l2_norms;
   if (distance_tag == DistanceMeasure::SQUARED_L2 && !dataset->empty()) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         squared_l2_norms,
         ComputeSquaredL2NormsFromQuantizedDataset(
             quantization_results.quantized_dataset,
@@ -176,10 +184,24 @@ ScalarQuantizedBruteForceSearcher::CreateWithFixedRange(
   }
 
   return std::make_unique<ScalarQuantizedBruteForceSearcher>(
-      distance, std::move(squared_l2_norms),
-      std::move(quantization_results.quantized_dataset),
-      std::move(quantization_results.inverse_multiplier_by_dimension),
+      distance, make_shared<vector<float>>(std::move(squared_l2_norms)),
+      make_shared<DenseDataset<int8_t>>(
+          std::move(quantization_results.quantized_dataset)),
+      make_shared<vector<float>>(
+          std::move(quantization_results.inverse_multiplier_by_dimension)),
       default_num_neighbors, default_epsilon);
+}
+
+StatusOr<const SingleMachineSearcherBase<float>*>
+ScalarQuantizedBruteForceSearcher::CreateBruteForceSearcher(
+    const DistanceMeasureConfig& distance_config,
+    unique_ptr<SingleMachineSearcherBase<float>>* storage) const {
+  auto base_result = SingleMachineSearcherBase<float>::CreateBruteForceSearcher(
+      distance_config, storage);
+  if (base_result.ok()) {
+    return base_result;
+  }
+  return this;
 }
 
 ScalarQuantizedBruteForceSearcher::~ScalarQuantizedBruteForceSearcher() {}
@@ -187,12 +209,12 @@ ScalarQuantizedBruteForceSearcher::~ScalarQuantizedBruteForceSearcher() {}
 Status ScalarQuantizedBruteForceSearcher::EnableCrowdingImpl(
     ConstSpan<int64_t> datapoint_index_to_crowding_attribute) {
   if (datapoint_index_to_crowding_attribute.size() !=
-      quantized_dataset_.size()) {
+      quantized_dataset_->size()) {
     return InvalidArgumentError(absl::StrCat(
         "datapoint_index_to_crowding_attribute must have size equal to "
         "number of datapoints.  (",
         datapoint_index_to_crowding_attribute.size(), " vs. ",
-        quantized_dataset_.size(), "."));
+        quantized_dataset_->size(), "."));
   }
   return OkStatus();
 }
@@ -205,11 +227,11 @@ Status ScalarQuantizedBruteForceSearcher::FindNeighborsImpl(
     return InvalidArgumentError(
         "ScalarQuantizedBruteForceSearcher only works with dense data.");
   }
-  if (query.dimensionality() != quantized_dataset_.dimensionality()) {
+  if (query.dimensionality() != quantized_dataset_->dimensionality()) {
     return FailedPreconditionError(absl::StrFormat(
         "Query dimensionality (%d) does not match quantized database "
         "dimensionality (%d)",
-        query.dimensionality(), quantized_dataset_.dimensionality()));
+        query.dimensionality(), quantized_dataset_->dimensionality()));
   }
   DatapointPtr<float> preprocessed;
   unique_ptr<float[]> preproc_buf;
@@ -224,13 +246,13 @@ Status ScalarQuantizedBruteForceSearcher::FindNeighborsImpl(
     preprocessed =
         MakeDatapointPtr(casted->PreprocessedQuery(), query.nonzero_entries());
   } else {
-    if (inverse_multiplier_by_dimension_.empty())
+    if (inverse_multiplier_by_dimension_->empty())
       return InvalidArgumentError(
           "TreeScalarQuantizationPreprocessedQuery is not specified and "
           "inverse "
           "multipliers are empty.");
     preproc_buf = PrepareForAsymmetricScalarQuantizedDotProduct(
-        query, inverse_multiplier_by_dimension_);
+        query, *inverse_multiplier_by_dimension_);
     preprocessed = MakeDatapointPtr(preproc_buf.get(), query.nonzero_entries());
   }
 
@@ -240,10 +262,10 @@ Status ScalarQuantizedBruteForceSearcher::FindNeighborsImpl(
     return UnimplementedError("Restricts not supported.");
   } else {
     auto dot_products_ptr =
-        static_cast<float*>(malloc(quantized_dataset_.size() * sizeof(float)));
+        static_cast<float*>(malloc(quantized_dataset_->size() * sizeof(float)));
     MutableSpan<float> dot_products(dot_products_ptr,
-                                    quantized_dataset_.size());
-    DenseDotProductDistanceOneToManyInt8Float(preprocessed, quantized_dataset_,
+                                    quantized_dataset_->size());
+    DenseDotProductDistanceOneToManyInt8Float(preprocessed, *quantized_dataset_,
                                               dot_products);
     Status status = use_min_distance ? PostprocessDistances<true, float>(
                                            query, params, dot_products, result)
@@ -273,7 +295,7 @@ Status ScalarQuantizedBruteForceSearcher::PostprocessDistances(
           },
           result);
     case DistanceMeasure::SQUARED_L2: {
-      ConstSpan<float> squared_norms = squared_l2_norms_;
+      ConstSpan<float> squared_norms = *squared_l2_norms_;
       const float query_squared_l2_norm = SquaredL2Norm(query);
       return PostprocessDistancesImpl<kUseMinDistance>(
           query, params, dot_products,
@@ -384,7 +406,7 @@ StatusOr<SingleMachineSearcherBase<float>::Mutator*>
 ScalarQuantizedBruteForceSearcher::GetMutator() const {
   if (!mutator_) {
     auto mutable_this = const_cast<ScalarQuantizedBruteForceSearcher*>(this);
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         mutator_,
         ScalarQuantizedBruteForceSearcher::Mutator::Create(mutable_this));
     SCANN_RETURN_IF_ERROR(mutator_->PrepareForBaseMutation(mutable_this));
@@ -394,7 +416,7 @@ ScalarQuantizedBruteForceSearcher::GetMutator() const {
 
 StatusOr<SingleMachineFactoryOptions>
 ScalarQuantizedBruteForceSearcher::ExtractSingleMachineFactoryOptions() {
-  TF_ASSIGN_OR_RETURN(
+  SCANN_ASSIGN_OR_RETURN(
       auto opts,
       SingleMachineSearcherBase<float>::ExtractSingleMachineFactoryOptions());
   if (opts.pre_quantized_fixed_point != nullptr) {
@@ -405,9 +427,25 @@ ScalarQuantizedBruteForceSearcher::ExtractSingleMachineFactoryOptions() {
   }
   opts.pre_quantized_fixed_point =
       make_shared<PreQuantizedFixedPoint>(CreatePreQuantizedFixedPoint(
-          quantized_dataset_, inverse_multiplier_by_dimension_,
-          squared_l2_norms_, true));
+          *quantized_dataset_, *inverse_multiplier_by_dimension_,
+          *squared_l2_norms_, true));
   return opts;
+}
+
+StatusOr<unique_ptr<ScalarQuantizedBruteForceSearcher>>
+ScalarQuantizedBruteForceSearcher::
+    CreateFromQuantizedDatasetAndInverseMultipliers(
+        shared_ptr<const DistanceMeasure> distance,
+        DenseDataset<int8_t> quantized, vector<float> inverse_multipliers,
+        vector<float> squared_l2_norms, int32_t default_num_neighbors,
+        float default_epsilon) {
+  using std::make_shared;
+  using std::move;
+  return CreateFromQuantizedDatasetAndInverseMultipliers(
+      move(distance), make_shared<DenseDataset<int8_t>>(move(quantized)),
+      make_shared<vector<float>>(move(inverse_multipliers)),
+      make_shared<vector<float>>(move(squared_l2_norms)), default_num_neighbors,
+      default_epsilon);
 }
 
 }  // namespace research_scann

@@ -17,6 +17,10 @@
 #ifndef SCANN_DISTANCE_MEASURES_ONE_TO_MANY_ONE_TO_MANY_SYMMETRIC_H_
 #define SCANN_DISTANCE_MEASURES_ONE_TO_MANY_ONE_TO_MANY_SYMMETRIC_H_
 
+#ifndef HWY_DISABLED_TARGETS
+#define HWY_DISABLED_TARGETS HWY_ALL_SVE
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -25,32 +29,35 @@
 #include <type_traits>
 
 #include "absl/base/optimization.h"
+#include "absl/base/prefetch.h"
 #include "absl/synchronization/mutex.h"
+#include "hwy/highway.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
 #include "scann/distance_measures/distance_measures.h"
 #include "scann/distance_measures/one_to_many/one_to_many_helpers.h"
+#include "scann/distance_measures/one_to_many/one_to_many_symmetric.h"
 #include "scann/utils/common.h"
 #include "scann/utils/internal/avx2_funcs.h"
 #include "scann/utils/internal/avx_funcs.h"
 #include "scann/utils/intrinsics/fma.h"
+#include "scann/utils/intrinsics/highway.h"
 #include "scann/utils/intrinsics/horizontal_sum.h"
 #include "scann/utils/intrinsics/simd.h"
 #include "scann/utils/types.h"
-#include "tensorflow/core/platform/prefetch.h"
 
 namespace research_scann {
 
 #ifdef __SSE3__
 
 namespace one_to_many_low_level {
-constexpr bool kSimd = true;
+constexpr bool kX64Simd = true;
 }
 
 #else
 
 namespace one_to_many_low_level {
-constexpr bool kSimd = false;
+constexpr bool kX64Simd = false;
 }
 
 #endif
@@ -166,8 +173,9 @@ void DenseLimitedInnerProductDistanceOneToMany(
 
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
-enable_if_t<
-    IsIntegerType<T>() && sizeof(T) == 4 && one_to_many_low_level::kSimd, void>
+enable_if_t<IsIntegerType<T>() && sizeof(T) == 4 &&
+                one_to_many_low_level::kX64Simd,
+            void>
 DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
                                      const DatasetView* __restrict__ database,
                                      MutableSpan<ResultElem> result,
@@ -176,7 +184,7 @@ DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 enable_if_t<!IsIntegerType<T>() || sizeof(T) != 4 ||
-                !one_to_many_low_level::kSimd,
+                !one_to_many_low_level::kX64Simd,
             void>
 DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
                                      const DatasetView* __restrict__ database,
@@ -193,7 +201,8 @@ namespace one_to_many_low_level {
 
 template <typename T, typename DatasetView, typename Lambdas,
           typename ResultElem, typename CallbackFunctor>
-enable_if_t<IsIntegerType<T>() || !kSimd, void>
+enable_if_t<IsIntegerType<T>() || (std::is_same_v<T, double> && !kX64Simd),
+            void>
 DenseAccumulatingDistanceMeasureOneToMany(
     const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
     const Lambdas& lambdas, MutableSpan<ResultElem> result,
@@ -209,7 +218,7 @@ DenseAccumulatingDistanceMeasureOneToMany(
 
 template <typename T, typename DatasetView, typename Lambdas,
           typename ResultElem, typename CallbackFunctor>
-enable_if_t<IsIntegerType<T>() || !kSimd, void>
+enable_if_t<IsIntegerType<T>(), void>
 DenseAccumulatingDistanceMeasureOneToManyNoFma(
     const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
     const Lambdas& lambdas, MutableSpan<ResultElem> result,
@@ -220,122 +229,6 @@ DenseAccumulatingDistanceMeasureOneToManyNoFma(
 }
 
 #ifdef __SSE3__
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, bool kShouldPrefetch, typename CallbackFunctor>
-enable_if_t<std::is_same<T, float>::value, void> SCANN_OUTLINE
-DenseAccumulatingDistanceMeasureOneToManyInternal(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  if (result.empty()) return;
-  DCHECK(!pool || !kShouldPrefetch);
-  const size_t dims = query.dimensionality();
-  DCHECK_EQ(dims, database->dimensionality());
-
-  DCHECK_GT(dims, 0);
-  Lambdas lambdas_vec[4] = {lambdas, lambdas, lambdas, lambdas};
-  const size_t num_outer_iters = result.size() / 3;
-  const size_t parallel_end = num_outer_iters * 3;
-
-  constexpr size_t kMinPrefetchAheadDims =
-      (IsFloatingType<ResultElem>()) ? 512 : 256;
-  size_t num_prefetch_datapoints;
-  if (kShouldPrefetch) {
-    num_prefetch_datapoints = std::max<size_t>(1, kMinPrefetchAheadDims / dims);
-  }
-
-  auto get_db_ptr = [&database, result, callback](size_t i)
-                        SCANN_INLINE_LAMBDA -> const float* {
-    auto idx = GetDatapointIndex(result, i);
-    callback->prefetch(idx);
-    return database->GetPtr(idx);
-  };
-
-  auto sum4 = [](__m128 x) -> float {
-    x = _mm_add_ps(x, _mm_castsi128_ps(_mm_srli_si128(_mm_castps_si128(x), 8)));
-    return x[0] + x[1];
-  };
-
-  ParallelFor<8>(
-      Seq(num_outer_iters), pool, [&](size_t i) ABSL_ATTRIBUTE_ALWAYS_INLINE {
-        const float* f0 = get_db_ptr(i);
-        const float* f1 = get_db_ptr(i + num_outer_iters);
-        const float* f2 = get_db_ptr(i + 2 * num_outer_iters);
-        const float *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
-
-        if (kShouldPrefetch && i + num_prefetch_datapoints < num_outer_iters) {
-          p0 = get_db_ptr(i + num_prefetch_datapoints);
-          p1 = get_db_ptr(i + num_outer_iters + num_prefetch_datapoints);
-          p2 = get_db_ptr(i + 2 * num_outer_iters + num_prefetch_datapoints);
-        }
-
-        __m128 a0 = _mm_setzero_ps();
-        __m128 a1 = _mm_setzero_ps();
-        __m128 a2 = _mm_setzero_ps();
-        size_t j = 0;
-
-        for (; j + 4 <= dims; j += 4) {
-          __m128 q = _mm_loadu_ps(query.values() + j);
-          __m128 v0 = _mm_loadu_ps(f0 + j);
-          __m128 v1 = _mm_loadu_ps(f1 + j);
-          __m128 v2 = _mm_loadu_ps(f2 + j);
-
-          if (kShouldPrefetch && p0) {
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p0 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p1 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p2 + j);
-          }
-
-          a0 = _mm_add_ps(a0, lambdas_vec[0].GetTerm(q, v0));
-          a1 = _mm_add_ps(a1, lambdas_vec[1].GetTerm(q, v1));
-          a2 = _mm_add_ps(a2, lambdas_vec[2].GetTerm(q, v2));
-        }
-
-        if (j + 2 <= dims) {
-          __m128 q = _mm_setzero_ps();
-          __m128 v0 = _mm_setzero_ps();
-          __m128 v1 = _mm_setzero_ps();
-          __m128 v2 = _mm_setzero_ps();
-          q = _mm_loadh_pi(q,
-                           reinterpret_cast<const __m64*>(query.values() + j));
-          v0 = _mm_loadh_pi(v0, reinterpret_cast<const __m64*>(f0 + j));
-          v1 = _mm_loadh_pi(v1, reinterpret_cast<const __m64*>(f1 + j));
-          v2 = _mm_loadh_pi(v2, reinterpret_cast<const __m64*>(f2 + j));
-          a0 = _mm_add_ps(a0, lambdas_vec[0].GetTerm(q, v0));
-          a1 = _mm_add_ps(a1, lambdas_vec[1].GetTerm(q, v1));
-          a2 = _mm_add_ps(a2, lambdas_vec[2].GetTerm(q, v2));
-          j += 2;
-        }
-
-        float result0 = sum4(a0);
-        float result1 = sum4(a1);
-        float result2 = sum4(a2);
-
-        if (j < dims) {
-          DCHECK_EQ(j + 1, dims);
-          result0 += lambdas_vec[0].GetTerm(query.values()[j], f0[j]);
-          result1 += lambdas_vec[1].GetTerm(query.values()[j], f1[j]);
-          result2 += lambdas_vec[2].GetTerm(query.values()[j], f2[j]);
-        }
-
-        callback->invoke(i, lambdas_vec[0].Postprocess(result0));
-        callback->invoke(i + num_outer_iters,
-                         lambdas_vec[1].Postprocess(result1));
-        callback->invoke(i + 2 * num_outer_iters,
-                         lambdas_vec[2].Postprocess(result2));
-      });
-
-  size_t i = parallel_end;
-  for (; i < result.size(); ++i) {
-    const DatapointPtr<float> f0 = MakeDatapointPtr<T>(
-        database->GetPtr(GetDatapointIndex(result, i)), dims);
-    callback->invoke(i, lambdas.VectorVector(query, f0));
-  }
-}
 
 SCANN_AVX1_INLINE __m128 SumTopBottomAvx(__m256 x) {
   const __m128 upper = _mm256_extractf128_ps(x, 1);
@@ -381,7 +274,7 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx1(
     return x[0] + x[1];
   };
 
-  ParallelFor<8>(Seq(num_outer_iters), pool, [&](size_t i) SCANN_AVX1 {
+  ParallelFor<32>(Seq(num_outer_iters), pool, [&](size_t i) SCANN_AVX1 {
     const float* f0 = get_db_ptr(i);
     const float* f1 = get_db_ptr(i + num_outer_iters);
     const float* f2 = get_db_ptr(i + 2 * num_outer_iters);
@@ -405,17 +298,14 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx1(
       __m256 v2 = _mm256_loadu_ps(f2 + j);
 
       if (kShouldPrefetch && p0) {
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p0 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p1 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p2 +
-                                                                           j);
+        absl::PrefetchToLocalCache(p0 + j);
+        absl::PrefetchToLocalCache(p1 + j);
+        absl::PrefetchToLocalCache(p2 + j);
       }
 
-      a0_256 = _mm256_add_ps(a0_256, lambdas_vec[0].GetTerm(q, v0));
-      a1_256 = _mm256_add_ps(a1_256, lambdas_vec[1].GetTerm(q, v1));
-      a2_256 = _mm256_add_ps(a2_256, lambdas_vec[2].GetTerm(q, v2));
+      a0_256 = lambdas_vec[0].AccTerm(a0_256, q, v0);
+      a1_256 = lambdas_vec[1].AccTerm(a1_256, q, v1);
+      a2_256 = lambdas_vec[2].AccTerm(a2_256, q, v2);
     }
 
     __m128 a0 = SumTopBottomAvx(a0_256);
@@ -429,17 +319,14 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx1(
       __m128 v2 = _mm_loadu_ps(f2 + j);
 
       if (kShouldPrefetch && p0) {
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p0 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p1 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p2 +
-                                                                           j);
+        absl::PrefetchToLocalCache(p0 + j);
+        absl::PrefetchToLocalCache(p1 + j);
+        absl::PrefetchToLocalCache(p2 + j);
       }
 
-      a0 = _mm_add_ps(a0, lambdas_vec[0].GetTerm(q, v0));
-      a1 = _mm_add_ps(a1, lambdas_vec[1].GetTerm(q, v1));
-      a2 = _mm_add_ps(a2, lambdas_vec[2].GetTerm(q, v2));
+      a0 = lambdas_vec[0].AccTerm(a0, q, v0);
+      a1 = lambdas_vec[1].AccTerm(a1, q, v1);
+      a2 = lambdas_vec[2].AccTerm(a2, q, v2);
       j += 4;
     }
 
@@ -452,9 +339,9 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx1(
       v0 = _mm_loadh_pi(v0, reinterpret_cast<const __m64*>(f0 + j));
       v1 = _mm_loadh_pi(v1, reinterpret_cast<const __m64*>(f1 + j));
       v2 = _mm_loadh_pi(v2, reinterpret_cast<const __m64*>(f2 + j));
-      a0 = _mm_add_ps(a0, lambdas_vec[0].GetTerm(q, v0));
-      a1 = _mm_add_ps(a1, lambdas_vec[1].GetTerm(q, v1));
-      a2 = _mm_add_ps(a2, lambdas_vec[2].GetTerm(q, v2));
+      a0 = lambdas_vec[0].AccTerm(a0, q, v0);
+      a1 = lambdas_vec[1].AccTerm(a1, q, v1);
+      a2 = lambdas_vec[2].AccTerm(a2, q, v2);
       j += 2;
     }
 
@@ -464,9 +351,9 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx1(
 
     if (j < dims) {
       DCHECK_EQ(j + 1, dims);
-      result0 += lambdas_vec[0].GetTerm(query.values()[j], f0[j]);
-      result1 += lambdas_vec[1].GetTerm(query.values()[j], f1[j]);
-      result2 += lambdas_vec[2].GetTerm(query.values()[j], f2[j]);
+      result0 = lambdas_vec[0].AccTerm(result0, query.values()[j], f0[j]);
+      result1 = lambdas_vec[1].AccTerm(result1, query.values()[j], f1[j]);
+      result2 = lambdas_vec[2].AccTerm(result2, query.values()[j], f2[j]);
     }
 
     callback->invoke(i, lambdas_vec[0].Postprocess(result0));
@@ -519,7 +406,7 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx2(
     return x[0] + x[1];
   };
 
-  ParallelFor<8>(Seq(num_outer_iters), pool, [&](size_t i) SCANN_AVX2 {
+  ParallelFor<32>(Seq(num_outer_iters), pool, [&](size_t i) SCANN_AVX2 {
     const float* f0 = get_db_ptr(i);
     const float* f1 = get_db_ptr(i + num_outer_iters);
     const float* f2 = get_db_ptr(i + 2 * num_outer_iters);
@@ -543,12 +430,9 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx2(
       __m256 v2 = _mm256_loadu_ps(f2 + j);
 
       if (kShouldPrefetch && p0) {
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p0 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p1 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p2 +
-                                                                           j);
+        absl::PrefetchToLocalCache(p0 + j);
+        absl::PrefetchToLocalCache(p1 + j);
+        absl::PrefetchToLocalCache(p2 + j);
       }
 
       a0_256 = lambdas_vec[0].FmaTerm(a0_256, q, v0);
@@ -567,12 +451,9 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx2(
       __m128 v2 = _mm_loadu_ps(f2 + j);
 
       if (kShouldPrefetch && p0) {
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p0 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p1 +
-                                                                           j);
-        ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(p2 +
-                                                                           j);
+        absl::PrefetchToLocalCache(p0 + j);
+        absl::PrefetchToLocalCache(p1 + j);
+        absl::PrefetchToLocalCache(p2 + j);
       }
 
       a0 = lambdas_vec[0].FmaTerm(a0, q, v0);
@@ -602,9 +483,9 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx2(
 
     if (j < dims) {
       DCHECK_EQ(j + 1, dims);
-      result0 += lambdas_vec[0].GetTerm(query.values()[j], f0[j]);
-      result1 += lambdas_vec[1].GetTerm(query.values()[j], f1[j]);
-      result2 += lambdas_vec[2].GetTerm(query.values()[j], f2[j]);
+      result0 = lambdas_vec[0].AccTerm(result0, query.values()[j], f0[j]);
+      result1 = lambdas_vec[1].AccTerm(result1, query.values()[j], f1[j]);
+      result2 = lambdas_vec[2].AccTerm(result2, query.values()[j], f2[j]);
     }
 
     callback->invoke(i, lambdas_vec[0].Postprocess(result0));
@@ -619,200 +500,6 @@ DenseAccumulatingDistanceMeasureOneToManyInternalAvx2(
         MakeDatapointPtr(database->GetPtr(GetDatapointIndex(result, i)), dims);
     callback->invoke(i, lambdas.VectorVector(query, f0));
   }
-}
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, typename CallbackFunctor>
-enable_if_t<std::is_same<T, float>::value, void>
-DenseAccumulatingDistanceMeasureOneToManyNoFma(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  constexpr size_t kMinPrefetchAheadDims =
-      (IsFloatingType<ResultElem>()) ? 8 : 4;
-  constexpr size_t kMaxPrefetchAheadDims = 512;
-  const DimensionIndex dims = query.nonzero_entries();
-
-  if (dims < 8 || !RuntimeSupportsAvx1()) {
-    if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
-        database->dimensionality() >= kMinPrefetchAheadDims) {
-      return DenseAccumulatingDistanceMeasureOneToManyInternal<
-          T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
-                                                     result, callback, nullptr);
-    } else {
-      return DenseAccumulatingDistanceMeasureOneToManyInternal<
-          T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
-                                                      result, callback, pool);
-    }
-  }
-
-  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
-      database->dimensionality() >= kMinPrefetchAheadDims) {
-    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx1<
-        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
-                                                   result, callback, nullptr);
-  } else {
-    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx1<
-        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
-                                                    result, callback, pool);
-  }
-}
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, typename CallbackFunctor>
-enable_if_t<std::is_same<T, float>::value, void>
-DenseAccumulatingDistanceMeasureOneToMany(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  constexpr size_t kMinPrefetchAheadDims =
-      (IsFloatingType<ResultElem>()) ? 8 : 4;
-  constexpr size_t kMaxPrefetchAheadDims = 512;
-  const DimensionIndex dims = query.nonzero_entries();
-
-  if (dims < 8 || !RuntimeSupportsAvx2()) {
-    return DenseAccumulatingDistanceMeasureOneToManyNoFma<T, DatasetView,
-                                                          Lambdas, ResultElem>(
-        query, database, lambdas, result, callback, pool);
-  }
-
-  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
-      database->dimensionality() >= kMinPrefetchAheadDims) {
-    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx2<
-        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
-                                                   result, callback, nullptr);
-  } else {
-    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx2<
-        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
-                                                    result, callback, pool);
-  }
-}
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, bool kShouldPrefetch, typename CallbackFunctor>
-enable_if_t<std::is_same<T, double>::value, void>
-DenseAccumulatingDistanceMeasureOneToManyInternal(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  if (result.empty()) return;
-  const size_t dims = query.dimensionality();
-
-  DCHECK_EQ(database->dimensionality(), dims);
-  DCHECK_GT(dims, 0);
-  Lambdas lambdas_vec[3] = {lambdas, lambdas, lambdas};
-  const size_t num_outer_iters = result.size() / 3;
-  const size_t parallel_end = num_outer_iters * 3;
-
-  constexpr size_t kMinPrefetchAheadDims =
-      (IsFloatingType<ResultElem>()) ? 256 : 128;
-  size_t num_prefetch_datapoints;
-  if (kShouldPrefetch) {
-    num_prefetch_datapoints = std::max<size_t>(1, kMinPrefetchAheadDims / dims);
-  }
-
-  auto get_db_ptr = [&database, result, callback](size_t i)
-                        SCANN_INLINE_LAMBDA -> const double* {
-    auto idx = GetDatapointIndex(result, i);
-    callback->prefetch(idx);
-    return database->GetPtr(idx);
-  };
-
-  ParallelFor<8>(
-      Seq(num_outer_iters), pool, [&](size_t i) ABSL_ATTRIBUTE_ALWAYS_INLINE {
-        const double* f0 = get_db_ptr(i);
-        const double* f1 = get_db_ptr(i + num_outer_iters);
-        const double* f2 = get_db_ptr(i + 2 * num_outer_iters);
-        const double *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
-
-        if (kShouldPrefetch && i + num_prefetch_datapoints < num_outer_iters) {
-          p0 = get_db_ptr(i + num_prefetch_datapoints);
-          p1 = get_db_ptr(i + num_outer_iters + num_prefetch_datapoints);
-          p2 = get_db_ptr(i + 2 * num_outer_iters + num_prefetch_datapoints);
-        }
-
-        __m128d a0 = _mm_setzero_pd();
-        __m128d a1 = _mm_setzero_pd();
-        __m128d a2 = _mm_setzero_pd();
-        size_t j = 0;
-        for (; j + 2 <= dims; j += 2) {
-          __m128d q = _mm_loadu_pd(query.values() + j);
-          __m128d v0 = _mm_loadu_pd(f0 + j);
-          __m128d v1 = _mm_loadu_pd(f1 + j);
-          __m128d v2 = _mm_loadu_pd(f2 + j);
-
-          if (kShouldPrefetch && p0) {
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p0 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p1 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p2 + j);
-          }
-
-          a0 = _mm_add_pd(a0, lambdas_vec[0].GetTerm(q, v0));
-          a1 = _mm_add_pd(a1, lambdas_vec[1].GetTerm(q, v1));
-          a2 = _mm_add_pd(a2, lambdas_vec[2].GetTerm(q, v2));
-        }
-
-        double result0 = a0[0] + a0[1];
-        double result1 = a1[0] + a1[1];
-        double result2 = a2[0] + a2[1];
-
-        if (j < dims) {
-          DCHECK_EQ(j + 1, dims);
-          result0 += lambdas_vec[0].GetTerm(query.values()[j], f0[j]);
-          result1 += lambdas_vec[1].GetTerm(query.values()[j], f1[j]);
-          result2 += lambdas_vec[2].GetTerm(query.values()[j], f2[j]);
-        }
-
-        callback->invoke(i, lambdas_vec[0].Postprocess(result0));
-        callback->invoke(i + num_outer_iters,
-                         lambdas_vec[1].Postprocess(result1));
-        callback->invoke(i + 2 * num_outer_iters,
-                         lambdas_vec[2].Postprocess(result2));
-      });
-
-  size_t i = parallel_end;
-  for (; i < result.size(); ++i) {
-    const DatapointPtr<double> f0 = MakeDatapointPtr<double>(
-        database->GetPtr(GetDatapointIndex(result, i)), dims);
-    callback->invoke(i, lambdas.VectorVector(query, f0));
-  }
-}
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, typename CallbackFunctor>
-enable_if_t<std::is_same<T, double>::value, void>
-DenseAccumulatingDistanceMeasureOneToMany(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  constexpr size_t kMinPrefetchAheadDims =
-      (IsFloatingType<ResultElem>()) ? 4 : 2;
-  constexpr size_t kMaxPrefetchAheadDims = 256;
-  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
-      database->dimensionality() >= kMinPrefetchAheadDims) {
-    return DenseAccumulatingDistanceMeasureOneToManyInternal<
-        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
-                                                   result, callback, nullptr);
-  } else {
-    return DenseAccumulatingDistanceMeasureOneToManyInternal<
-        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
-                                                    result, callback, pool);
-  }
-}
-
-template <typename T, typename DatasetView, typename Lambdas,
-          typename ResultElem, typename CallbackFunctor>
-SCANN_INLINE enable_if_t<std::is_same<T, double>::value, void>
-DenseAccumulatingDistanceMeasureOneToManyNoFma(
-    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
-    const Lambdas& lambdas, MutableSpan<ResultElem> result,
-    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
-  return DenseAccumulatingDistanceMeasureOneToMany<T, DatasetView, Lambdas,
-                                                   ResultElem>(
-      query, database, lambdas, result, callback, pool);
 }
 
 template <typename T, typename DatasetView, typename ResultElem,
@@ -849,7 +536,7 @@ void DenseGeneralHammingDistanceMeasureOneToManyInternal(
     return _mm_cvtsi128_si32(x);
   };
 
-  ParallelFor<8>(
+  ParallelFor<32>(
       Seq(num_outer_iters), pool, [&](size_t i) ABSL_ATTRIBUTE_ALWAYS_INLINE {
         const T* i0 = get_db_ptr(i);
         const T* i1 = get_db_ptr(i + num_outer_iters);
@@ -878,12 +565,9 @@ void DenseGeneralHammingDistanceMeasureOneToManyInternal(
               _mm_loadu_si128(reinterpret_cast<const __m128i*>(i2 + j));
 
           if (kShouldPrefetch && p0) {
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p0 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p1 + j);
-            ::tensorflow::port::prefetch<::tensorflow::port::PREFETCH_HINT_T0>(
-                p2 + j);
+            absl::PrefetchToLocalCache(p0 + j);
+            absl::PrefetchToLocalCache(p1 + j);
+            absl::PrefetchToLocalCache(p2 + j);
           }
 
           a0 = _mm_sub_epi32(a0, _mm_cmpeq_epi32(q, v0));
@@ -933,14 +617,326 @@ void DenseGeneralHammingDistanceMeasureOneToManyInternal(
 
 #endif
 
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, typename CallbackFunctor>
+enable_if_t<std::is_same<T, float>::value, void>
+DenseAccumulatingDistanceMeasureOneToManyNoFma(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  constexpr size_t kMinPrefetchAheadDims =
+      (IsFloatingType<ResultElem>()) ? 8 : 4;
+  constexpr size_t kMaxPrefetchAheadDims = 512;
+  const DimensionIndex dims = query.nonzero_entries();
+
+  if (dims < 8 || !kX64Simd || !RuntimeSupportsAvx1()) {
+    if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
+        database->dimensionality() >= kMinPrefetchAheadDims) {
+      return DenseAccumulatingDistanceMeasureOneToManyInternal<
+          T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
+                                                     result, callback, nullptr);
+    } else {
+      return DenseAccumulatingDistanceMeasureOneToManyInternal<
+          T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
+                                                      result, callback, pool);
+    }
+  }
+
+#ifdef __x86_64__
+  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
+      database->dimensionality() >= kMinPrefetchAheadDims) {
+    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx1<
+        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
+                                                   result, callback, nullptr);
+  } else {
+    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx1<
+        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
+                                                    result, callback, pool);
+  }
+#endif
+}
+
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, typename CallbackFunctor>
+enable_if_t<std::is_same<T, float>::value, void>
+DenseAccumulatingDistanceMeasureOneToMany(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  const DimensionIndex dims = query.nonzero_entries();
+
+  if (dims < 8 || !kX64Simd || !RuntimeSupportsAvx2()) {
+    return DenseAccumulatingDistanceMeasureOneToManyNoFma<T, DatasetView,
+                                                          Lambdas, ResultElem>(
+        query, database, lambdas, result, callback, pool);
+  }
+
+#ifdef __x86_64__
+  constexpr size_t kMinPrefetchAheadDims =
+      (IsFloatingType<ResultElem>()) ? 8 : 4;
+  constexpr size_t kMaxPrefetchAheadDims = 512;
+  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
+      database->dimensionality() >= kMinPrefetchAheadDims) {
+    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx2<
+        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
+                                                   result, callback, nullptr);
+  } else {
+    return DenseAccumulatingDistanceMeasureOneToManyInternalAvx2<
+        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
+                                                    result, callback, pool);
+  }
+#endif
+}
+
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, bool kShouldPrefetch, typename CallbackFunctor>
+enable_if_t<std::is_same_v<T, float>, void> SCANN_OUTLINE
+DenseAccumulatingDistanceMeasureOneToManyInternal(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  if (result.empty()) return;
+  DCHECK(!pool || !kShouldPrefetch);
+  const size_t dims = query.dimensionality();
+  DCHECK_EQ(dims, database->dimensionality());
+
+  DCHECK_GT(dims, 0);
+  Lambdas lambdas_vec[4] = {lambdas, lambdas, lambdas, lambdas};
+  const size_t num_outer_iters = result.size() / 3;
+  const size_t parallel_end = num_outer_iters * 3;
+
+  constexpr size_t kMinPrefetchAheadDims =
+      (IsFloatingType<ResultElem>()) ? 512 : 256;
+  size_t num_prefetch_datapoints;
+  if (kShouldPrefetch) {
+    num_prefetch_datapoints = std::max<size_t>(1, kMinPrefetchAheadDims / dims);
+  }
+
+  auto get_db_ptr = [&database, result, callback](size_t i)
+                        SCANN_INLINE_LAMBDA -> const float* {
+    auto idx = GetDatapointIndex(result, i);
+    callback->prefetch(idx);
+    return database->GetPtr(idx);
+  };
+
+  namespace hn = hwy::HWY_NAMESPACE;
+  using D = hn::ScalableTag<float>;
+  const D d;
+  using D2 = hn::ScalableTag<float, -1>;
+  const D2 d2;
+
+  ParallelFor<32>(
+      Seq(num_outer_iters), pool, [&](size_t i) ABSL_ATTRIBUTE_ALWAYS_INLINE {
+        const float* f0 = get_db_ptr(i);
+        const float* f1 = get_db_ptr(i + num_outer_iters);
+        const float* f2 = get_db_ptr(i + 2 * num_outer_iters);
+        const float *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
+
+        if (kShouldPrefetch && i + num_prefetch_datapoints < num_outer_iters) {
+          p0 = get_db_ptr(i + num_prefetch_datapoints);
+          p1 = get_db_ptr(i + num_outer_iters + num_prefetch_datapoints);
+          p2 = get_db_ptr(i + 2 * num_outer_iters + num_prefetch_datapoints);
+        }
+
+        hn::Vec<D> a0 = hn::Zero(d);
+        hn::Vec<D> a1 = hn::Zero(d);
+        hn::Vec<D> a2 = hn::Zero(d);
+        size_t j = 0;
+
+        for (; j + hn::Lanes(d) <= dims; j += hn::Lanes(d)) {
+          auto q = hn::LoadU(d, query.values() + j);
+          auto v0 = hn::LoadU(d, f0 + j);
+          auto v1 = hn::LoadU(d, f1 + j);
+          auto v2 = hn::LoadU(d, f2 + j);
+
+          if (kShouldPrefetch && p0) {
+            absl::PrefetchToLocalCache(p0 + j);
+            absl::PrefetchToLocalCache(p1 + j);
+            absl::PrefetchToLocalCache(p2 + j);
+          }
+
+          a0 = lambdas_vec[0].template AccTerm<D>(a0, q, v0);
+          a1 = lambdas_vec[1].template AccTerm<D>(a1, q, v1);
+          a2 = lambdas_vec[2].template AccTerm<D>(a2, q, v2);
+        }
+
+        if (j + hn::Lanes(d2) <= dims) {
+          auto q = hn::ZeroExtendVector(d, hn::LoadU(d2, query.values() + j));
+          auto v0 = hn::ZeroExtendVector(d, hn::LoadU(d2, f0 + j));
+          auto v1 = hn::ZeroExtendVector(d, hn::LoadU(d2, f1 + j));
+          auto v2 = hn::ZeroExtendVector(d, hn::LoadU(d2, f2 + j));
+          a0 = lambdas_vec[0].template AccTerm<D>(a0, q, v0);
+          a1 = lambdas_vec[1].template AccTerm<D>(a1, q, v1);
+          a2 = lambdas_vec[2].template AccTerm<D>(a2, q, v2);
+          j += hn::Lanes(d2);
+        }
+
+        float result0 = hn::ReduceSum(d, a0);
+        float result1 = hn::ReduceSum(d, a1);
+        float result2 = hn::ReduceSum(d, a2);
+
+        for (; j < dims; ++j) {
+          result0 = lambdas_vec[0].AccTerm(result0, query.values()[j], f0[j]);
+          result1 = lambdas_vec[1].AccTerm(result1, query.values()[j], f1[j]);
+          result2 = lambdas_vec[2].AccTerm(result2, query.values()[j], f2[j]);
+
+          if (hn::Lanes(d) <= 4) break;
+        }
+
+        callback->invoke(i, lambdas_vec[0].Postprocess(result0));
+        callback->invoke(i + num_outer_iters,
+                         lambdas_vec[1].Postprocess(result1));
+        callback->invoke(i + 2 * num_outer_iters,
+                         lambdas_vec[2].Postprocess(result2));
+      });
+
+  size_t i = parallel_end;
+  for (; i < result.size(); ++i) {
+    const DatapointPtr<float> f0 = MakeDatapointPtr<T>(
+        database->GetPtr(GetDatapointIndex(result, i)), dims);
+    callback->invoke(i, lambdas.VectorVector(query, f0));
+  }
+}
+
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, bool kShouldPrefetch, typename CallbackFunctor>
+enable_if_t<std::is_same_v<T, double>, void>
+DenseAccumulatingDistanceMeasureOneToManyInternal(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  if (result.empty()) return;
+  const size_t dims = query.dimensionality();
+
+  DCHECK_EQ(database->dimensionality(), dims);
+  DCHECK_GT(dims, 0);
+  Lambdas lambdas_vec[3] = {lambdas, lambdas, lambdas};
+  const size_t num_outer_iters = result.size() / 3;
+  const size_t parallel_end = num_outer_iters * 3;
+
+  constexpr size_t kMinPrefetchAheadDims =
+      (IsFloatingType<ResultElem>()) ? 256 : 128;
+  size_t num_prefetch_datapoints;
+  if (kShouldPrefetch) {
+    num_prefetch_datapoints = std::max<size_t>(1, kMinPrefetchAheadDims / dims);
+  }
+
+  auto get_db_ptr = [&database, result, callback](size_t i)
+                        SCANN_INLINE_LAMBDA -> const double* {
+    auto idx = GetDatapointIndex(result, i);
+    callback->prefetch(idx);
+    return database->GetPtr(idx);
+  };
+
+  namespace hn = hwy::HWY_NAMESPACE;
+  using D = hn::ScalableTag<double>;
+  const D d;
+
+  ParallelFor<32>(
+      Seq(num_outer_iters), pool, [&](size_t i) ABSL_ATTRIBUTE_ALWAYS_INLINE {
+        const double* f0 = get_db_ptr(i);
+        const double* f1 = get_db_ptr(i + num_outer_iters);
+        const double* f2 = get_db_ptr(i + 2 * num_outer_iters);
+        const double *p0 = nullptr, *p1 = nullptr, *p2 = nullptr;
+
+        if (kShouldPrefetch && i + num_prefetch_datapoints < num_outer_iters) {
+          p0 = get_db_ptr(i + num_prefetch_datapoints);
+          p1 = get_db_ptr(i + num_outer_iters + num_prefetch_datapoints);
+          p2 = get_db_ptr(i + 2 * num_outer_iters + num_prefetch_datapoints);
+        }
+
+        auto a0 = hn::Zero(d);
+        auto a1 = hn::Zero(d);
+        auto a2 = hn::Zero(d);
+        size_t j = 0;
+
+        const size_t kLanes = hn::Lanes(d);
+        for (; j + kLanes <= dims; j += kLanes) {
+          auto q = hn::LoadU(d, query.values() + j);
+          auto v0 = hn::LoadU(d, f0 + j);
+          auto v1 = hn::LoadU(d, f1 + j);
+          auto v2 = hn::LoadU(d, f2 + j);
+
+          if (kShouldPrefetch && p0) {
+            absl::PrefetchToLocalCache(p0 + j);
+            absl::PrefetchToLocalCache(p1 + j);
+            absl::PrefetchToLocalCache(p2 + j);
+          }
+
+          a0 = lambdas_vec[0].template AccTerm<D>(a0, q, v0);
+          a1 = lambdas_vec[1].template AccTerm<D>(a1, q, v1);
+          a2 = lambdas_vec[2].template AccTerm<D>(a2, q, v2);
+        }
+
+        double result0 = hn::ReduceSum(d, a0);
+        double result1 = hn::ReduceSum(d, a1);
+        double result2 = hn::ReduceSum(d, a2);
+
+        for (; j < dims; ++j) {
+          result0 = lambdas_vec[0].AccTerm(result0, query.values()[j], f0[j]);
+          result1 = lambdas_vec[1].AccTerm(result1, query.values()[j], f1[j]);
+          result2 = lambdas_vec[2].AccTerm(result2, query.values()[j], f2[j]);
+
+          if (kLanes <= 2) break;
+        }
+
+        callback->invoke(i, lambdas_vec[0].Postprocess(result0));
+        callback->invoke(i + num_outer_iters,
+                         lambdas_vec[1].Postprocess(result1));
+        callback->invoke(i + 2 * num_outer_iters,
+                         lambdas_vec[2].Postprocess(result2));
+      });
+
+  size_t i = parallel_end;
+  for (; i < result.size(); ++i) {
+    const DatapointPtr<double> f0 = MakeDatapointPtr<double>(
+        database->GetPtr(GetDatapointIndex(result, i)), dims);
+    callback->invoke(i, lambdas.VectorVector(query, f0));
+  }
+}
+
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, typename CallbackFunctor>
+enable_if_t<std::is_same<T, double>::value && kX64Simd, void>
+DenseAccumulatingDistanceMeasureOneToMany(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  constexpr size_t kMinPrefetchAheadDims =
+      (IsFloatingType<ResultElem>()) ? 4 : 2;
+  constexpr size_t kMaxPrefetchAheadDims = 256;
+  if (!pool && database->dimensionality() <= kMaxPrefetchAheadDims &&
+      database->dimensionality() >= kMinPrefetchAheadDims) {
+    return DenseAccumulatingDistanceMeasureOneToManyInternal<
+        T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
+                                                   result, callback, nullptr);
+  } else {
+    return DenseAccumulatingDistanceMeasureOneToManyInternal<
+        T, DatasetView, Lambdas, ResultElem, false>(query, database, lambdas,
+                                                    result, callback, pool);
+  }
+}
+
+template <typename T, typename DatasetView, typename Lambdas,
+          typename ResultElem, typename CallbackFunctor>
+SCANN_INLINE enable_if_t<std::is_same<T, double>::value, void>
+DenseAccumulatingDistanceMeasureOneToManyNoFma(
+    const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
+    const Lambdas& lambdas, MutableSpan<ResultElem> result,
+    CallbackFunctor* __restrict__ callback, ThreadPool* pool) {
+  return DenseAccumulatingDistanceMeasureOneToMany<T, DatasetView, Lambdas,
+                                                   ResultElem>(
+      query, database, lambdas, result, callback, pool);
+}
+
 template <typename T>
 class DotProductDistanceLambdas {
  public:
 #ifdef __SSE3__
-  static __m128 GetTerm(__m128 a, __m128 b) { return -_mm_mul_ps(a, b); }
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) { return acc - a * b; }
 
-  static SCANN_AVX1_INLINE __m256 GetTerm(__m256 a, __m256 b) {
-    return -_mm256_mul_ps(a, b);
+  static SCANN_AVX1_INLINE __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    return acc - a * b;
   }
 
   static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
@@ -951,11 +947,20 @@ class DotProductDistanceLambdas {
     return _mm_fnmadd_ps(a, b, acc);
   }
 
-  static __m128d GetTerm(__m128d a, __m128d b) { return -_mm_mul_pd(a, b); }
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    return acc - a * b;
+  }
 #endif
 
-  static float GetTerm(float a, float b) { return -a * b; }
-  static double GetTerm(double a, double b) { return -a * b; }
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    return hwy::HWY_NAMESPACE::NegMulAdd(a, b, acc);
+  }
+
+  static float AccTerm(float acc, float a, float b) { return acc - a * b; }
+  static double AccTerm(double acc, double a, double b) { return acc - a * b; }
   static float Postprocess(float val) { return val; }
   static double Postprocess(double val) { return val; }
 
@@ -966,6 +971,66 @@ class DotProductDistanceLambdas {
 
  private:
   DotProductDistance dist_;
+};
+
+template <typename T>
+class SquaredL2DistanceLambdas {
+ public:
+#ifdef __SSE3__
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) {
+    __m128 tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  SCANN_AVX1_INLINE static __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    __m256 tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
+    __m256 tmp = _mm256_sub_ps(a, b);
+    return _mm256_fmadd_ps(tmp, tmp, acc);
+  }
+
+  static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
+    __m128 tmp = _mm_sub_ps(a, b);
+    return _mm_fmadd_ps(tmp, tmp, acc);
+  }
+
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    __m128d tmp = a - b;
+    return acc + tmp * tmp;
+  }
+#endif
+
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    auto diff = a - b;
+    return hwy::HWY_NAMESPACE::MulAdd(diff, diff, acc);
+  }
+
+  static float AccTerm(float acc, float a, float b) {
+    const float tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  static double AccTerm(double acc, double a, double b) {
+    const double tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  static float Postprocess(float val) { return val; }
+  static double Postprocess(double val) { return val; }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  SquaredL2Distance dist_;
 };
 
 }  // namespace one_to_many_low_level
@@ -995,47 +1060,59 @@ void DenseDotProductDistanceOneToMany(const DatapointPtr<T>& query,
       query, &view, lambdas, result, &set_distance_functor, pool);
 }
 
+namespace one_to_many_low_level {
+template <typename T>
+class AbsDotProductDistanceLambdas {
+ public:
+#ifdef __SSE3__
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) { return acc + a * b; }
+
+  static SCANN_AVX1_INLINE __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    return acc + a * b;
+  }
+
+  static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
+    return _mm256_fmadd_ps(a, b, acc);
+  }
+
+  static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
+    return _mm_fmadd_ps(a, b, acc);
+  }
+
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    return acc + a * b;
+  }
+#endif
+
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    return hwy::HWY_NAMESPACE::MulAdd(a, b, acc);
+  }
+
+  static float AccTerm(double acc, float a, float b) { return acc + a * b; }
+  static double AccTerm(double acc, double a, double b) { return acc + a * b; }
+  static float Postprocess(float val) { return -std::abs(val); }
+  static double Postprocess(double val) { return -std::abs(val); }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  AbsDotProductDistance dist_;
+};
+}  // namespace one_to_many_low_level
+
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 void DenseAbsDotProductDistanceOneToMany(
     const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
     MutableSpan<ResultElem> result, CallbackFunctor* __restrict__ callback,
     ThreadPool* pool) {
-  class DotProductDistanceLambdas {
-   public:
-#ifdef __SSE3__
-    static __m128 GetTerm(__m128 a, __m128 b) { return _mm_mul_ps(a, b); }
-
-    static SCANN_AVX1_INLINE __m256 GetTerm(__m256 a, __m256 b) {
-      return _mm256_mul_ps(a, b);
-    }
-
-    static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
-      return _mm256_fmadd_ps(a, b, acc);
-    }
-
-    static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
-      return _mm_fmadd_ps(a, b, acc);
-    }
-
-    static __m128d GetTerm(__m128d a, __m128d b) { return _mm_mul_pd(a, b); }
-#endif
-
-    static float GetTerm(float a, float b) { return a * b; }
-    static double GetTerm(double a, double b) { return a * b; }
-    static float Postprocess(float val) { return -std::abs(val); }
-    static double Postprocess(double val) { return -std::abs(val); }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    AbsDotProductDistance dist_;
-  };
-
-  DotProductDistanceLambdas lambdas;
+  one_to_many_low_level::AbsDotProductDistanceLambdas<T> lambdas;
   return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToMany(
       query, database, lambdas, result, callback, pool);
 }
@@ -1052,6 +1129,52 @@ void DenseAbsDotProductDistanceOneToMany(const DatapointPtr<T>& query,
                                       &set_distance_functor, pool);
 }
 
+namespace one_to_many_low_level {
+template <typename T>
+class CosineDistanceLambdas {
+ public:
+#ifdef __SSE3__
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) { return acc + a * b; }
+
+  static SCANN_AVX1_INLINE __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    return acc + a * b;
+  }
+
+  static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
+    return _mm256_fmadd_ps(a, b, acc);
+  }
+
+  static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
+    return _mm_fmadd_ps(a, b, acc);
+  }
+
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    return acc + a * b;
+  }
+#endif
+
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    return hwy::HWY_NAMESPACE::MulAdd(a, b, acc);
+  }
+
+  static float AccTerm(float acc, float a, float b) { return acc + a * b; }
+  static double AccTerm(double acc, double a, double b) { return acc + a * b; }
+  static float Postprocess(float val) { return 1.0f - val; }
+  static double Postprocess(double val) { return 1.0 - val; }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  CosineDistance dist_;
+};
+}  // namespace one_to_many_low_level
+
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 void DenseCosineDistanceOneToMany(const DatapointPtr<T>& query,
@@ -1059,41 +1182,7 @@ void DenseCosineDistanceOneToMany(const DatapointPtr<T>& query,
                                   MutableSpan<ResultElem> result,
                                   CallbackFunctor* __restrict__ callback,
                                   ThreadPool* pool) {
-  class CosineDistanceLambdas {
-   public:
-#ifdef __SSE3__
-    static __m128 GetTerm(__m128 a, __m128 b) { return _mm_mul_ps(a, b); }
-
-    static SCANN_AVX1_INLINE __m256 GetTerm(__m256 a, __m256 b) {
-      return _mm256_mul_ps(a, b);
-    }
-
-    static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
-      return _mm256_fmadd_ps(a, b, acc);
-    }
-
-    static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
-      return _mm_fmadd_ps(a, b, acc);
-    }
-
-    static __m128d GetTerm(__m128d a, __m128d b) { return _mm_mul_pd(a, b); }
-#endif
-
-    static float GetTerm(float a, float b) { return a * b; }
-    static double GetTerm(double a, double b) { return a * b; }
-    static float Postprocess(float val) { return 1.0f - val; }
-    static double Postprocess(double val) { return 1.0 - val; }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    CosineDistance dist_;
-  };
-
-  CosineDistanceLambdas lambdas;
+  one_to_many_low_level::CosineDistanceLambdas<T> lambdas;
   return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToMany(
       query, database, lambdas, result, callback, pool);
 }
@@ -1117,58 +1206,7 @@ void DenseSquaredL2DistanceOneToMany(const DatapointPtr<T>& query,
                                      MutableSpan<ResultElem> result,
                                      CallbackFunctor* __restrict__ callback,
                                      ThreadPool* pool) {
-  class SquaredL2DistanceLambdas {
-   public:
-#ifdef __SSE3__
-    static __m128 GetTerm(__m128 a, __m128 b) {
-      __m128 tmp = _mm_sub_ps(a, b);
-      return _mm_mul_ps(tmp, tmp);
-    }
-
-    SCANN_AVX1_INLINE static __m256 GetTerm(__m256 a, __m256 b) {
-      __m256 tmp = _mm256_sub_ps(a, b);
-      return _mm256_mul_ps(tmp, tmp);
-    }
-
-    static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
-      __m256 tmp = _mm256_sub_ps(a, b);
-      return _mm256_fmadd_ps(tmp, tmp, acc);
-    }
-
-    static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
-      __m128 tmp = _mm_sub_ps(a, b);
-      return _mm_fmadd_ps(tmp, tmp, acc);
-    }
-
-    static __m128d GetTerm(__m128d a, __m128d b) {
-      __m128d tmp = _mm_sub_pd(a, b);
-      return _mm_mul_pd(tmp, tmp);
-    }
-#endif
-
-    static float GetTerm(float a, float b) {
-      const float tmp = a - b;
-      return tmp * tmp;
-    }
-
-    static double GetTerm(double a, double b) {
-      const double tmp = a - b;
-      return tmp * tmp;
-    }
-
-    static float Postprocess(float val) { return val; }
-    static double Postprocess(double val) { return val; }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    SquaredL2Distance dist_;
-  };
-
-  SquaredL2DistanceLambdas lambdas;
+  one_to_many_low_level::SquaredL2DistanceLambdas<T> lambdas;
   return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToMany(
       query, database, lambdas, result, callback, pool);
 }
@@ -1185,6 +1223,68 @@ void DenseSquaredL2DistanceOneToMany(const DatapointPtr<T>& query,
                                   pool);
 }
 
+namespace one_to_many_low_level {
+template <typename T>
+class L2DistanceLambdas {
+ public:
+#ifdef __SSE3__
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) {
+    __m128 tmp = _mm_sub_ps(a, b);
+    return acc + tmp * tmp;
+  }
+
+  SCANN_AVX1_INLINE static __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    __m256 tmp = _mm256_sub_ps(a, b);
+    return acc + tmp * tmp;
+  }
+
+  static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
+    __m256 tmp = _mm256_sub_ps(a, b);
+    return _mm256_fmadd_ps(tmp, tmp, acc);
+  }
+
+  static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
+    __m128 tmp = _mm_sub_ps(a, b);
+    return _mm_fmadd_ps(tmp, tmp, acc);
+  }
+
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    __m128d tmp = _mm_sub_pd(a, b);
+    return acc + tmp * tmp;
+  }
+#endif
+
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    auto diff = a - b;
+    return hwy::HWY_NAMESPACE::MulAdd(diff, diff, acc);
+  }
+
+  static float AccTerm(float acc, float a, float b) {
+    const float tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  static double AccTerm(double acc, double a, double b) {
+    const double tmp = a - b;
+    return acc + tmp * tmp;
+  }
+
+  static float Postprocess(float val) { return std::sqrt(val); }
+  static double Postprocess(double val) { return std::sqrt(val); }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  L2Distance dist_;
+};
+}  // namespace one_to_many_low_level
+
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 void DenseL2DistanceOneToMany(const DatapointPtr<T>& query,
@@ -1192,58 +1292,7 @@ void DenseL2DistanceOneToMany(const DatapointPtr<T>& query,
                               MutableSpan<ResultElem> result,
                               CallbackFunctor* __restrict__ callback,
                               ThreadPool* pool) {
-  class L2DistanceLambdas {
-   public:
-#ifdef __SSE3__
-    static __m128 GetTerm(__m128 a, __m128 b) {
-      __m128 tmp = _mm_sub_ps(a, b);
-      return _mm_mul_ps(tmp, tmp);
-    }
-
-    SCANN_AVX1_INLINE static __m256 GetTerm(__m256 a, __m256 b) {
-      __m256 tmp = _mm256_sub_ps(a, b);
-      return _mm256_mul_ps(tmp, tmp);
-    }
-
-    static SCANN_AVX2_INLINE __m256 FmaTerm(__m256 acc, __m256 a, __m256 b) {
-      __m256 tmp = _mm256_sub_ps(a, b);
-      return _mm256_fmadd_ps(tmp, tmp, acc);
-    }
-
-    static SCANN_AVX2_INLINE __m128 FmaTerm(__m128 acc, __m128 a, __m128 b) {
-      __m128 tmp = _mm_sub_ps(a, b);
-      return _mm_fmadd_ps(tmp, tmp, acc);
-    }
-
-    static __m128d GetTerm(__m128d a, __m128d b) {
-      __m128d tmp = _mm_sub_pd(a, b);
-      return _mm_mul_pd(tmp, tmp);
-    }
-#endif
-
-    static float GetTerm(float a, float b) {
-      const float tmp = a - b;
-      return tmp * tmp;
-    }
-
-    static double GetTerm(double a, double b) {
-      const double tmp = a - b;
-      return tmp * tmp;
-    }
-
-    static float Postprocess(float val) { return std::sqrt(val); }
-    static double Postprocess(double val) { return std::sqrt(val); }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    L2Distance dist_;
-  };
-
-  L2DistanceLambdas lambdas;
+  one_to_many_low_level::L2DistanceLambdas<T> lambdas;
   return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToMany(
       query, database, lambdas, result, callback, pool);
 }
@@ -1259,6 +1308,90 @@ void DenseL2DistanceOneToMany(const DatapointPtr<T>& query,
   DenseL2DistanceOneToMany(query, &view, result, &set_distance_functor, pool);
 }
 
+namespace one_to_many_low_level {
+#ifdef __SSE3__
+constexpr int32_t kAbsMaskScalar = 0x7FFFFFFF;
+#endif
+
+template <typename T>
+class L1DistanceLambdas {
+ public:
+#ifdef __SSE3__
+  static __m128 AccTerm(__m128 acc, __m128 a, __m128 b) {
+    return acc + AbsPs(_mm_sub_ps(a, b));
+  }
+
+  SCANN_AVX1_INLINE static __m256 AccTerm(__m256 acc, __m256 a, __m256 b) {
+    return acc + AbsPs(_mm256_sub_ps(a, b));
+  }
+
+  static __m128d AccTerm(__m128d acc, __m128d a, __m128d b) {
+    return acc + AbsPd(_mm_sub_pd(a, b));
+  }
+#endif
+
+  template <typename D>
+  static hwy::HWY_NAMESPACE::Vec<D> AccTerm(hwy::HWY_NAMESPACE::Vec<D> acc,
+                                            hwy::HWY_NAMESPACE::Vec<D> a,
+                                            hwy::HWY_NAMESPACE::Vec<D> b) {
+    return acc + hwy::HWY_NAMESPACE::Abs(a - b);
+  }
+
+  static float AccTerm(double acc, float a, float b) {
+    return acc + std::abs(a - b);
+  }
+
+  static double AccTerm(double acc, double a, double b) {
+    return acc + std::abs(a - b);
+  }
+
+  static float Postprocess(float val) { return val; }
+  static double Postprocess(double val) { return val; }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  L1Distance dist_;
+
+#ifdef __SSE3__
+
+  static const __m128 kAbsMaskVectorFloat;
+
+  static const __m128d kAbsMaskVectorDouble;
+
+  static __m128 AbsPs(__m128 x) { return _mm_and_ps(x, kAbsMaskVectorFloat); }
+  static SCANN_AVX1_INLINE __m256 AbsPs(__m256 x) {
+    static const __m256 kAbsMaskVectorFloat256 =
+        _mm256_castsi256_ps(_mm256_set_epi32(
+            kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar,
+            kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar));
+    return _mm256_and_ps(x, kAbsMaskVectorFloat256);
+  }
+
+  static __m128d AbsPd(__m128d x) {
+    return _mm_and_pd(x, kAbsMaskVectorDouble);
+  }
+#endif
+};
+
+#ifdef __SSE3__
+constexpr int32_t kAllSet = 0xFFFFFFFF;
+
+template <typename T>
+const __m128 L1DistanceLambdas<T>::kAbsMaskVectorFloat =
+    _mm_castsi128_ps(_mm_set_epi32(kAbsMaskScalar, kAbsMaskScalar,
+                                   kAbsMaskScalar, kAbsMaskScalar));
+
+template <typename T>
+const __m128d L1DistanceLambdas<T>::kAbsMaskVectorDouble = _mm_castsi128_pd(
+    _mm_set_epi32(kAbsMaskScalar, kAllSet, kAbsMaskScalar, kAllSet));
+#endif
+
+}  // namespace one_to_many_low_level
+
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 void DenseL1DistanceOneToMany(const DatapointPtr<T>& query,
@@ -1266,65 +1399,7 @@ void DenseL1DistanceOneToMany(const DatapointPtr<T>& query,
                               MutableSpan<ResultElem> result,
                               CallbackFunctor* __restrict__ callback,
                               ThreadPool* pool) {
-#ifdef __SSE3__
-
-  static constexpr int32_t kAbsMaskScalar = 0x7FFFFFFF;
-  static const __m128 kAbsMaskVectorFloat = _mm_castsi128_ps(_mm_set_epi32(
-      kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar));
-
-  static constexpr int32_t kAllSet = 0xFFFFFFFF;
-  static const __m128d kAbsMaskVectorDouble = _mm_castsi128_pd(
-      _mm_set_epi32(kAbsMaskScalar, kAllSet, kAbsMaskScalar, kAllSet));
-#endif
-
-  class L1DistanceLambdas {
-   public:
-#ifdef __SSE3__
-    static __m128 GetTerm(__m128 a, __m128 b) {
-      return AbsPs(_mm_sub_ps(a, b));
-    }
-
-    SCANN_AVX1_INLINE static __m256 GetTerm(__m256 a, __m256 b) {
-      return AbsPs(_mm256_sub_ps(a, b));
-    }
-
-    static __m128d GetTerm(__m128d a, __m128d b) {
-      return AbsPd(_mm_sub_pd(a, b));
-    }
-#endif
-
-    static float GetTerm(float a, float b) { return std::abs(a - b); }
-
-    static double GetTerm(double a, double b) { return std::abs(a - b); }
-
-    static float Postprocess(float val) { return val; }
-    static double Postprocess(double val) { return val; }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    L1Distance dist_;
-
-#ifdef __SSE3__
-    static __m128 AbsPs(__m128 x) { return _mm_and_ps(x, kAbsMaskVectorFloat); }
-    static SCANN_AVX1_INLINE __m256 AbsPs(__m256 x) {
-      static const __m256 kAbsMaskVectorFloat256 =
-          _mm256_castsi256_ps(_mm256_set_epi32(
-              kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar,
-              kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar, kAbsMaskScalar));
-      return _mm256_and_ps(x, kAbsMaskVectorFloat256);
-    }
-
-    static __m128d AbsPd(__m128d x) {
-      return _mm_and_pd(x, kAbsMaskVectorDouble);
-    }
-#endif
-  };
-
-  L1DistanceLambdas lambdas;
+  one_to_many_low_level::L1DistanceLambdas<T> lambdas;
   return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToManyNoFma(
       query, database, lambdas, result, callback, pool);
 }
@@ -1340,102 +1415,118 @@ void DenseL1DistanceOneToMany(const DatapointPtr<T>& query,
   DenseL1DistanceOneToMany(query, &view, result, &set_distance_functor, pool);
 }
 
+namespace limited_inner_internal {
+
+namespace hn = hwy::HWY_NAMESPACE;
+using HwyFloats = decltype(hn::Zero(hn::ScalableTag<float>()));
+using HwyDoubles = decltype(hn::Zero(hn::ScalableTag<double>()));
+
+template <typename T>
+class LimitedInnerProductDistanceLambdas {
+ public:
+  explicit LimitedInnerProductDistanceLambdas(double norm_query2)
+      : norm_a2_(norm_query2) {}
+
+  template <typename D>
+  hn::Vec<D> AccTerm(hn::Vec<D> acc, hn::Vec<D> a, hn::Vec<D> b) {
+    return AccTermImpl(acc, a, b);
+  }
+
+  float AccTerm(float acc, float a, float b) {
+    norm_b2_s_ += b * b;
+    return acc + a * b;
+  }
+
+  double AccTerm(double acc, double a, double b) {
+    norm_b2_d_ += b * b;
+    return acc + a * b;
+  }
+
+  float Postprocess(float val) {
+    norm_b2_s_ += hn::ReduceSum(hn::ScalableTag<float>(), norm_b2_ps_);
+
+    norm_b2_ps_ = hn::Zero(hn::ScalableTag<float>());
+
+    const float denom = std::sqrt(
+        norm_a2_ * std::max(static_cast<float>(norm_a2_), norm_b2_s_));
+
+    norm_b2_s_ = 0;
+    if (denom == 0.0f) {
+      return 0.0f;
+    }
+    return -val / denom;
+  }
+
+  double Postprocess(double val) {
+    norm_b2_d_ += hn::ReduceSum(hn::ScalableTag<double>(), norm_b2_pd_);
+
+    norm_b2_pd_ = hn::Zero(hn::ScalableTag<double>());
+
+    const double denom = std::sqrt(norm_a2_ * std::max(norm_a2_, norm_b2_d_));
+
+    norm_b2_d_ = 0;
+    if (denom == 0.0) {
+      return 0.0;
+    }
+    return -val / denom;
+  }
+
+  double VectorVector(const DatapointPtr<T>& a,
+                      const DatapointPtr<T>& b) const {
+    return dist_.GetDistanceDense(a, b);
+  }
+
+ private:
+  HwyFloats AccTermImpl(HwyFloats acc, HwyFloats a, HwyFloats b) {
+    norm_b2_ps_ = hn::MulAdd(b, b, norm_b2_ps_);
+    return hn::MulAdd(a, b, acc);
+  }
+
+  HwyDoubles AccTermImpl(HwyDoubles acc, HwyDoubles a, HwyDoubles b) {
+    norm_b2_pd_ = hn::MulAdd(b, b, norm_b2_pd_);
+    return hn::MulAdd(a, b, acc);
+  }
+
+  LimitedInnerProductDistance dist_;
+  double norm_a2_;
+
+  HwyFloats norm_b2_ps_ = hn::Zero(hn::ScalableTag<float>());
+  HwyDoubles norm_b2_pd_ = hn::Zero(hn::ScalableTag<double>());
+
+  float norm_b2_s_ = 0;
+  double norm_b2_d_ = 0;
+};
+
+}  // namespace limited_inner_internal
+
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 void DenseLimitedInnerProductDistanceOneToMany(
     const DatapointPtr<T>& query, const DatasetView* __restrict__ database,
     MutableSpan<ResultElem> result, CallbackFunctor* __restrict__ callback,
     ThreadPool* pool) {
-  class LimitedInnerProductDistanceLambdas {
-   public:
-    explicit LimitedInnerProductDistanceLambdas(double norm_query2)
-        : norm_a2_(norm_query2) {}
+  using Lambdas = limited_inner_internal::LimitedInnerProductDistanceLambdas<T>;
+  Lambdas lambdas(SquaredL2Norm(query));
+  if constexpr (std::is_floating_point_v<T>) {
+    constexpr size_t kMinPrefetchAheadDims =
+        (IsFloatingType<ResultElem>()) ? (32 / sizeof(T)) : (16 / sizeof(T));
+    constexpr size_t kMaxPrefetchAheadDims = 2048 / sizeof(T);
 
-#ifdef __SSE3__
-    __m128 GetTerm(__m128 a, __m128 b) {
-      norm_b2_ps_ = _mm_add_ps(norm_b2_ps_, _mm_mul_ps(b, b));
-      return _mm_mul_ps(a, b);
+    if (database->dimensionality() <= kMaxPrefetchAheadDims &&
+        database->dimensionality() >= kMinPrefetchAheadDims) {
+      return DenseAccumulatingDistanceMeasureOneToManyInternal<
+          T, DatasetView, Lambdas, ResultElem, true>(query, database, lambdas,
+                                                     result, callback, nullptr);
+    } else {
+      return DenseAccumulatingDistanceMeasureOneToManyInternal<
+          T, DatasetView, Lambdas, ResultElem, false>(
+          query, database, lambdas, result, callback, nullptr);
     }
-
-    SCANN_AVX1_INLINE __m256 GetTerm(__m256 a, __m256 b) {
-      norm_b2_ps_ = _mm_add_ps(
-          norm_b2_ps_,
-          one_to_many_low_level::SumTopBottomAvx(_mm256_mul_ps(b, b)));
-      return _mm256_mul_ps(a, b);
-    }
-
-    __m128d GetTerm(__m128d a, __m128d b) {
-      norm_b2_pd_ = _mm_add_pd(norm_b2_pd_, _mm_mul_pd(b, b));
-      return _mm_mul_pd(a, b);
-    }
-#endif
-
-    float GetTerm(float a, float b) {
-      norm_b2_s_ += b * b;
-      return a * b;
-    }
-
-    double GetTerm(double a, double b) {
-      norm_b2_d_ += b * b;
-      return a * b;
-    }
-
-    float Postprocess(float val) {
-#ifdef __SSE3__
-      norm_b2_ps_ = _mm_hadd_ps(norm_b2_ps_, norm_b2_ps_);
-      norm_b2_ps_ = _mm_hadd_ps(norm_b2_ps_, norm_b2_ps_);
-
-      norm_b2_s_ += norm_b2_ps_[0];
-
-      norm_b2_ps_ = _mm_setzero_ps();
-#endif
-      const float denom = std::sqrt(
-          norm_a2_ * std::max(static_cast<float>(norm_a2_), norm_b2_s_));
-
-      norm_b2_s_ = 0;
-      if (denom == 0.0f) {
-        return 0.0f;
-      }
-      return -val / denom;
-    }
-
-    double Postprocess(double val) {
-#ifdef __SSE3__
-      norm_b2_pd_ = _mm_hadd_pd(norm_b2_pd_, norm_b2_pd_);
-
-      norm_b2_d_ += norm_b2_pd_[0];
-
-      norm_b2_pd_ = _mm_setzero_pd();
-#endif
-      const double denom = std::sqrt(norm_a2_ * std::max(norm_a2_, norm_b2_d_));
-
-      norm_b2_d_ = 0;
-      if (denom == 0.0) {
-        return 0.0;
-      }
-      return -val / denom;
-    }
-
-    double VectorVector(const DatapointPtr<T>& a,
-                        const DatapointPtr<T>& b) const {
-      return dist_.GetDistanceDense(a, b);
-    }
-
-   private:
-    LimitedInnerProductDistance dist_;
-    double norm_a2_;
-
-#ifdef __SSE3__
-    __m128 norm_b2_ps_ = _mm_setzero_ps();
-    __m128d norm_b2_pd_ = _mm_setzero_pd();
-#endif
-    float norm_b2_s_ = 0;
-    double norm_b2_d_ = 0;
-  };
-
-  LimitedInnerProductDistanceLambdas lambdas(SquaredL2Norm(query));
-  return one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToManyNoFma(
-      query, database, lambdas, result, callback, pool);
+  } else {
+    return one_to_many_low_level::
+        DenseAccumulatingDistanceMeasureOneToManyNoFma(query, database, lambdas,
+                                                       result, callback, pool);
+  }
 }
 
 template <typename T, typename ResultElem>
@@ -1454,8 +1545,9 @@ void DenseLimitedInnerProductDistanceOneToMany(const DatapointPtr<T>& query,
 
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
-enable_if_t<
-    IsIntegerType<T>() && sizeof(T) == 4 && one_to_many_low_level::kSimd, void>
+enable_if_t<IsIntegerType<T>() && sizeof(T) == 4 &&
+                one_to_many_low_level::kX64Simd,
+            void>
 DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
                                      const DatasetView* __restrict__ database,
                                      MutableSpan<ResultElem> result,
@@ -1483,7 +1575,7 @@ DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
 template <typename T, typename ResultElem, typename DatasetView,
           typename CallbackFunctor>
 enable_if_t<!IsIntegerType<T>() || sizeof(T) != 4 ||
-                !one_to_many_low_level::kSimd,
+                !one_to_many_low_level::kX64Simd,
             void>
 DenseGeneralHammingDistanceOneToMany(const DatapointPtr<T>& query,
                                      const DatasetView* __restrict__ database,
@@ -1595,6 +1687,111 @@ void DenseDistanceOneToMany(const DistanceMeasure& dist,
       one_to_many_low_level::SetDistanceFunctor<ResultElem>>(
       dist, query, database, result, &set_distance_functor, pool);
 }
+
+#define SCANN_INSTANTIATE_ONE_TO_MANY_NO_AVX(                                  \
+    EXTERN_KEYWORD, TYPE, DATASET_VIEW, LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH, \
+    CALLBACK_FUNCTOR)                                                          \
+  EXTERN_KEYWORD template void                                                 \
+  one_to_many_low_level::DenseAccumulatingDistanceMeasureOneToManyInternal<    \
+      TYPE, DATASET_VIEW, LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH,               \
+      CALLBACK_FUNCTOR>(                                                       \
+      const DatapointPtr<TYPE>& query,                                         \
+      const DATASET_VIEW* __restrict__ database, const LAMBDAS& lambdas,       \
+      MutableSpan<RESULT_ELEM> result,                                         \
+      CALLBACK_FUNCTOR* __restrict__ callback, ThreadPool* pool);
+
+#ifdef __x86_64__
+#define SCANN_INSTANTIATE_ONE_TO_MANY(EXTERN_KEYWORD, TYPE, DATASET_VIEW,     \
+                                      LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH,  \
+                                      CALLBACK_FUNCTOR)                       \
+  SCANN_INSTANTIATE_ONE_TO_MANY_NO_AVX(EXTERN_KEYWORD, TYPE, DATASET_VIEW,    \
+                                       LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH, \
+                                       CALLBACK_FUNCTOR)                      \
+  EXTERN_KEYWORD template void one_to_many_low_level::                        \
+      DenseAccumulatingDistanceMeasureOneToManyInternalAvx1<                  \
+          TYPE, DATASET_VIEW, LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH,          \
+          CALLBACK_FUNCTOR>(                                                  \
+          const DatapointPtr<TYPE>& query,                                    \
+          const DATASET_VIEW* __restrict__ database, const LAMBDAS& lambdas,  \
+          MutableSpan<RESULT_ELEM> result,                                    \
+          CALLBACK_FUNCTOR* __restrict__ callback, ThreadPool* pool);         \
+  EXTERN_KEYWORD template void one_to_many_low_level::                        \
+      DenseAccumulatingDistanceMeasureOneToManyInternalAvx2<                  \
+          TYPE, DATASET_VIEW, LAMBDAS, RESULT_ELEM, SHOULD_PREFETCH,          \
+          CALLBACK_FUNCTOR>(                                                  \
+          const DatapointPtr<TYPE>& query,                                    \
+          const DATASET_VIEW* __restrict__ database, const LAMBDAS& lambdas,  \
+          MutableSpan<RESULT_ELEM> result,                                    \
+          CALLBACK_FUNCTOR* __restrict__ callback, ThreadPool* pool);
+
+#else
+#define SCANN_INSTANTIATE_ONE_TO_MANY SCANN_INSTANTIATE_ONE_TO_MANY_NO_AVX
+#endif
+
+#define SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(EXTERN_KEYWORD, \
+                                                          TYPE, LAMBDAS)  \
+  SCANN_INSTANTIATE_ONE_TO_MANY(                                          \
+      EXTERN_KEYWORD, TYPE, DefaultDenseDatasetView<TYPE>, LAMBDAS, TYPE, \
+      false, one_to_many_low_level::SetDistanceFunctor<TYPE>)             \
+  SCANN_INSTANTIATE_ONE_TO_MANY(                                          \
+      EXTERN_KEYWORD, TYPE, DefaultDenseDatasetView<TYPE>, LAMBDAS, TYPE, \
+      true, one_to_many_low_level::SetDistanceFunctor<TYPE>)
+
+#define SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(         \
+    EXTERN_KEYWORD, TYPE, LAMBDAS)                                        \
+  SCANN_INSTANTIATE_ONE_TO_MANY_NO_AVX(                                   \
+      EXTERN_KEYWORD, TYPE, DefaultDenseDatasetView<TYPE>, LAMBDAS, TYPE, \
+      false, one_to_many_low_level::SetDistanceFunctor<TYPE>)             \
+  SCANN_INSTANTIATE_ONE_TO_MANY_NO_AVX(                                   \
+      EXTERN_KEYWORD, TYPE, DefaultDenseDatasetView<TYPE>, LAMBDAS, TYPE, \
+      true, one_to_many_low_level::SetDistanceFunctor<TYPE>)
+
+#define SCANN_INSTANTIATE_COMMON_FLOAT_ONE_TO_MANY(EXTERN_KEYWORD)            \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(                          \
+      EXTERN_KEYWORD, float,                                                  \
+      one_to_many_low_level::DotProductDistanceLambdas<float>)                \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(                          \
+      EXTERN_KEYWORD, float,                                                  \
+      one_to_many_low_level::SquaredL2DistanceLambdas<float>)                 \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(                          \
+      EXTERN_KEYWORD, float,                                                  \
+      one_to_many_low_level::CosineDistanceLambdas<float>)                    \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(                          \
+      EXTERN_KEYWORD, float,                                                  \
+      one_to_many_low_level::AbsDotProductDistanceLambdas<float>)             \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE(                          \
+      EXTERN_KEYWORD, float, one_to_many_low_level::L2DistanceLambdas<float>) \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(                   \
+      EXTERN_KEYWORD, float,                                                  \
+      limited_inner_internal::LimitedInnerProductDistanceLambdas<float>)      \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(                   \
+      EXTERN_KEYWORD, float, one_to_many_low_level::L1DistanceLambdas<float>)
+
+#define SCANN_INSTANTIATE_COMMON_DOUBLE_ONE_TO_MANY(EXTERN_KEYWORD)       \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::DotProductDistanceLambdas<double>)           \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::SquaredL2DistanceLambdas<double>)            \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::CosineDistanceLambdas<double>)               \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::AbsDotProductDistanceLambdas<double>)        \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::L2DistanceLambdas<double>)                   \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      limited_inner_internal::LimitedInnerProductDistanceLambdas<double>) \
+  SCANN_INSTANTIATE_COMMON_ONE_TO_MANY_FOR_DISTANCE_NO_AVX(               \
+      EXTERN_KEYWORD, double,                                             \
+      one_to_many_low_level::L1DistanceLambdas<double>)
+
+SCANN_INSTANTIATE_COMMON_FLOAT_ONE_TO_MANY(extern)
+SCANN_INSTANTIATE_COMMON_DOUBLE_ONE_TO_MANY(extern)
 
 }  // namespace research_scann
 

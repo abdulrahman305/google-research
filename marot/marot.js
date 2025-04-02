@@ -4229,6 +4229,15 @@ class Marot {
   }
 
   /**
+   * Escapes regular expressions so the contents are matched literally.
+   * @param {string} unescapedRegex
+   * @return {string}
+   */
+  escapeRegex(unescapedRegex) {
+    return unescapedRegex.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  /**
    * Convenience function to escape html in each token.
    * @param {!Array<string>} tokens
    * @return {!Array<string>}
@@ -4632,7 +4641,7 @@ class Marot {
         const v = document.getElementById(`marot-val-${rowId}-${col}`);
         if (!v) continue;
         v.addEventListener('click', (e) => {
-          filter.value = '^' + parts[col] + '$';
+          filter.value = '^' + this.escapeRegex(parts[col]) + '$';
           this.show();
         });
       }
@@ -5025,7 +5034,8 @@ class Marot {
       let html = '<option value=""></option>\n';
       for (let o in opt) {
         if (!o) continue;
-        html += `<option value="^${o}$">${o}</option>\n`;
+        const escapedValue = this.escapeRegex(o);
+        html += `<option value="^${escapedValue}$">${o}</option>\n`;
       }
       sel.innerHTML = html;
     }
@@ -5467,6 +5477,11 @@ class Marot {
      */
     const data = [];
     const FAKE_FIELD = '--marot-FAKE-FIELD--';
+    // Export the lowest-index MQM-like metric. If MQM itself is visible, it
+    // will be chosen as it always has index 0. Otherwise, this will generally
+    // be an AutoMQM metric for which scores are present.
+    const firstMqmMetricIndex = Math.min(this.mqmMetricsVisible);
+    const metricToSave = this.metrics[firstMqmMetricIndex];
     if (aggregation == 'system') {
       for (let system in this.statsBySystem) {
         if (system == this.TOTAL) {
@@ -5476,7 +5491,8 @@ class Marot {
         const aggregate = this.aggregateUnitStats(unitStats);
         const dataRow = Array(this.DATA_COL_NUM_PARTS).fill(FAKE_FIELD);
         dataRow[this.DATA_COL_SYSTEM] = system;
-        dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+        dataRow[this.DATA_COL_METADATA] =
+            aggregate.mqmStats[metricToSave].score;
         data.push(dataRow);
       }
     } else if (aggregation == 'document') {
@@ -5492,7 +5508,8 @@ class Marot {
           const dataRow = Array(this.DATA_COL_NUM_PARTS).fill(FAKE_FIELD);
           dataRow[this.DATA_COL_SYSTEM] = system;
           dataRow[this.DATA_COL_DOC] = doc;
-          dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+          dataRow[this.DATA_COL_METADATA] =
+              aggregate.mqmStats[metricToSave].score;
           data.push(dataRow);
         }
       }
@@ -5513,7 +5530,8 @@ class Marot {
             dataRow[this.DATA_COL_SYSTEM] = system;
             dataRow[this.DATA_COL_DOC] = doc;
             dataRow[this.DATA_COL_DOC_SEG_ID] = seg;
-            dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+            dataRow[this.DATA_COL_METADATA] =
+                aggregate.mqmStats[metricToSave].score;
             data.push(dataRow);
           }
         }
@@ -5533,7 +5551,8 @@ class Marot {
               dataRow[this.DATA_COL_DOC] = doc;
               dataRow[this.DATA_COL_DOC_SEG_ID] = seg;
               dataRow[this.DATA_COL_RATER] = rater;
-              dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+              dataRow[this.DATA_COL_METADATA] =
+                  aggregate.mqmStats[metricToSave].score;
               data.push(dataRow);
             }
           }

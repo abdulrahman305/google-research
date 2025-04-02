@@ -22,7 +22,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -35,9 +37,12 @@
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_format.h"
+#include "absl/types/span.h"
+#include "scann/base/health_stats_collector.h"
 #include "scann/base/single_machine_base.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/dataset.h"
+#include "scann/distance_measures/one_to_one/l2_distance.h"
 #include "scann/hashes/asymmetric_hashing2/searcher.h"
 #include "scann/oss_wrappers/scann_status.h"
 #include "scann/oss_wrappers/scann_threadpool.h"
@@ -49,7 +54,6 @@
 #include "scann/utils/single_machine_autopilot.h"
 #include "scann/utils/types.h"
 #include "scann/utils/zip_sort.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -80,8 +84,8 @@ class TreeXHybridMutator
                                      size_t token_idx) const {
       if (!kIsTreeAHResidual) return dptr;
       return MakeDatapointPtr<T>(
-          residual_storage[0].get() + token_idx * dptr.dimensionality(),
-          dptr.dimensionality());
+          residual_storage[0].get() + token_idx * residual_dimensionality[0],
+          residual_dimensionality[0]);
     }
 
     vector<int32_t> tokens;
@@ -89,7 +93,10 @@ class TreeXHybridMutator
 
     enum { kIsTreeAHResidual = std::is_same_v<Searcher, TreeAHHybridResidual> };
     unique_ptr<T[]> residual_storage[kIsTreeAHResidual];
+
+    uint32_t residual_dimensionality[kIsTreeAHResidual];
     static_assert(kIsTreeAHResidual || sizeof(residual_storage) == 0);
+    static_assert(kIsTreeAHResidual || sizeof(residual_dimensionality) == 0);
     SCANN_DECLARE_MOVE_ONLY_CLASS(TreeXPrecomputedMutationArtifacts);
   };
 
@@ -104,6 +111,7 @@ class TreeXHybridMutator
 
   ComputePrecomputedMutationArtifacts(const TypedDataset<T>& batch) const final;
 
+  absl::StatusOr<Datapoint<T>> GetDatapoint(DatapointIndex i) const override;
   DatapointPtr<T> GetDatapointPtr(DatapointIndex i, Datapoint<T>* storage,
                                   bool always_copy = false) const;
 
@@ -119,7 +127,8 @@ class TreeXHybridMutator
   Status EnableIncrementalTraining(const ScannConfig& config) final;
   Status EnableIncrementalTraining(shared_ptr<TreeXHybridIncrementalOptions>);
 
-  void CheckReassignment(int32_t token);
+  void CheckReassignment(int32_t token,
+                         const MutationOptions& mo = MutationOptions());
 
   Status ShrinkPartition(int32_t token = kInvalidToken);
 
@@ -127,10 +136,13 @@ class TreeXHybridMutator
 
   Status IngestUpdate(DatapointIndex token, DatapointPtr<T> x, int delta);
 
-  Status Reassign(ConstSpan<int32_t> tokens);
-  Status Reassign(int32_t token) { return Reassign(vector<int32_t>{token}); }
+  Status Reassign(ConstSpan<int32_t> tokens, const MutationOptions& mo);
+  Status Reassign(int32_t token, const MutationOptions& mo) {
+    return Reassign({&token, 1}, mo);
+  }
 
-  Status ReassignTopK(int32_t token, int32_t max_split);
+  Status ReassignTopK(int32_t token, int32_t max_split,
+                      const MutationOptions& mo);
 
   StatusOr<DatapointIndex> AddDatapoint(const DatapointPtr<T>& dptr,
                                         string_view docid,
@@ -173,12 +185,14 @@ class TreeXHybridMutator
   StatusOr<DatapointIndex> AddDatapoint(
       const DatapointPtr<T>& dptr, string_view docid,
       const TreeXPrecomputedMutationArtifacts& ma, const MutationOptions& mo);
+
   template <typename GlobalToLocal>
   StatusOr<DatapointIndex> UpdateDatapoint(
-      const DatapointPtr<T>& dptr, DatapointIndex index,
+      const DatapointPtr<T>& dptr, DatapointIndex dp_idx,
       const TreeXPrecomputedMutationArtifacts& ma, const MutationOptions& mo);
+
   template <typename GlobalToLocal>
-  Status RemoveDatapointImpl(DatapointIndex index);
+  Status RemoveDatapointImpl(DatapointIndex dp_idx);
 
   template <typename GlobalToLocal>
   Status UpdateSubIndex(DatapointIndex dp_idx, int token_idx,
@@ -212,6 +226,8 @@ class TreeXHybridMutator
     std::fill(x.begin(), x.end(),
               std::make_pair(kInvalidToken, kInvalidDatapointIndex));
   }
+
+  Status InitializeCentroids();
 
   template <typename GlobalToLocalT>
   static GlobalToLocalT CreateGlobalToLocal(
@@ -263,6 +279,16 @@ class TreeXHybridMutator
     return std::holds_alternative<GlobalToLocal1>(global_to_local_);
   }
 
+  Status UpdateCentroid(DatapointPtr<float> x, int32_t token,
+                        bool stats_update);
+
+  Status RemoveEmptyCentroid(int32_t token);
+
+  using HealthStatsCollector = typename Searcher::HealthStatsCollector;
+  HealthStatsCollector& stats_collector() const {
+    return searcher_->stats_collector_;
+  }
+
   Searcher* searcher_ = nullptr;
 
   enum : int { kInvalidToken = -1 };
@@ -275,8 +301,10 @@ class TreeXHybridMutator
 
   std::shared_ptr<KMeansTreePartitioner<typename Searcher::DataType>> centroid_;
 
-  bool reassignment_in_flight_ = false;
   absl::flat_hash_set<int32_t> reassignment_set_;
+  std::vector<Datapoint<float>> old_centroids_;
+
+  int32_t updated_token_centroid_ = kInvalidToken;
 };
 
 class TreeXHybridIncrementalOptions {
@@ -285,6 +313,7 @@ class TreeXHybridIncrementalOptions {
   std::variant<float, DatapointIndex> incremental_threshold_;
   int32_t cluster_stability_size_ = 200;
   uint32_t max_split_ = std::numeric_limits<uint32_t>::max();
+  bool enable_health_stats_collection_ = false;
 };
 
 #define SCANN_DISPATCH_ON_GLOBAL_TO_LOCAL(function, ...)            \
@@ -305,6 +334,33 @@ std::vector<float> gradient_update(DatapointPtr<float> w, DatapointPtr<T> x,
     res.push_back(w.values_span()[i] * (1 - lr) + x.values_span()[i] * lr);
   }
   return res;
+}
+
+template <typename Searcher>
+absl::StatusOr<Datapoint<typename Searcher::DataType>>
+TreeXHybridMutator<Searcher>::GetDatapoint(DatapointIndex i) const {
+  size_t size = 0;
+  if (searcher_->shared_dataset()) {
+    size = searcher_->shared_dataset()->size();
+  } else if (searcher_->reordering_enabled()) {
+    size = searcher_->reordering_helper().dataset()->size();
+  } else {
+    if (std::holds_alternative<GlobalToLocal1>(global_to_local_)) {
+      auto& global_to_local = std::get<GlobalToLocal1>(global_to_local_);
+      size = global_to_local.size();
+    } else {
+      auto& global_to_local = std::get<GlobalToLocal2>(global_to_local_);
+      size = global_to_local.size();
+    }
+  }
+  if (i >= size) {
+    return OutOfRangeError(
+        "Datapoint index out of bound: index = %d, but size = %d.", i, size);
+  }
+
+  Datapoint<T> dp;
+  GetDatapointPtr(i, &dp, true);
+  return dp;
 }
 
 template <typename Searcher>
@@ -330,7 +386,7 @@ TreeXHybridMutator<Searcher>::GetDatapointPtr(
       auto idx = global_to_local[i][0];
       x = searcher_->leaf_searchers_[idx.first]->GetDatapointPtr(idx.second);
     } else {
-      auto& global_to_local = std::get<GlobalToLocal1>(global_to_local_);
+      auto& global_to_local = std::get<GlobalToLocal2>(global_to_local_);
       auto idx = global_to_local[i][0];
       x = searcher_->leaf_searchers_[idx.first]->GetDatapointPtr(idx.second);
     }
@@ -347,7 +403,7 @@ template <typename Searcher>
 Status TreeXHybridMutator<Searcher>::IngestUpdate(DatapointIndex token,
                                                   DatapointPtr<T> x,
                                                   int delta) {
-  DatapointIndex n = searcher_->datapoints_by_token_[token].size();
+  DatapointIndex n = searcher_->datapoints_by_token_[token].size() + delta;
 
   float lr = std::min(0.001, 1.0 / n) * delta;
 
@@ -389,7 +445,15 @@ Status TreeXHybridMutator<Searcher>::EnableIncrementalTraining(
     shared_ptr<TreeXHybridIncrementalOptions> incremental_opts) {
   incremental_opts_ = incremental_opts;
   mutation_stats_.resize(searcher_->datapoints_by_token_.size(), 0.0f);
+  if (incremental_opts_ && incremental_opts_->enable_health_stats_collection_) {
+    SCANN_RETURN_IF_ERROR(searcher_->InitializeHealthStats());
+  }
 
+  return InitializeCentroids();
+}
+
+template <typename Searcher>
+Status TreeXHybridMutator<Searcher>::InitializeCentroids() {
   auto pd = std::dynamic_pointer_cast<
       const KMeansTreePartitioner<typename Searcher::DataType>>(
       searcher_->database_tokenizer_);
@@ -416,26 +480,36 @@ Status TreeXHybridMutator<Searcher>::AddCentroid(DatapointPtr<float> x) {
       << "Incremental training must be enabled for AddCentroid.";
 
   SCANN_RETURN_IF_ERROR(searcher_->AddLeafSearcher());
-  TF_ASSIGN_OR_RETURN(auto leaf_mutator,
-                      searcher_->leaf_searchers_.back()->GetMutator());
+  SCANN_ASSIGN_OR_RETURN(auto leaf_mutator,
+                         searcher_->leaf_searchers_.back()->GetMutator());
   leaf_mutators_.push_back(leaf_mutator);
   mutation_stats_.push_back(0.0f);
+  stats_collector().AddPartition();
 
-  TF_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
+  SCANN_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
   return mutator->AddDatapoint(x, "");
 }
 
 template <typename Searcher>
 Status TreeXHybridMutator<Searcher>::RemoveCentroid(int32_t token) {
+  SCANN_RET_CHECK_LT(token, searcher_->datapoints_by_token_.size())
+      << "Incorrect token number: " << token;
+  auto& datapoints_by_token = searcher_->datapoints_by_token_;
+  while (!datapoints_by_token[token].empty())
+    SCANN_RETURN_IF_ERROR(RemoveDatapoint(datapoints_by_token[token].back()));
+  return RemoveEmptyCentroid(token);
+}
+
+template <typename Searcher>
+Status TreeXHybridMutator<Searcher>::RemoveEmptyCentroid(int32_t token) {
   SCANN_RET_CHECK_NE(nullptr, centroid_)
       << "Incremental training must be enabled for RemoveCentroid.";
   SCANN_RET_CHECK_LT(token, searcher_->datapoints_by_token_.size())
       << "Incorrect token number: " << token;
 
   auto& datapoints_by_token = searcher_->datapoints_by_token_;
+  SCANN_RET_CHECK(datapoints_by_token[token].empty());
   int32_t n_tokens = datapoints_by_token.size();
-  while (!datapoints_by_token[token].empty())
-    SCANN_RETURN_IF_ERROR(RemoveDatapoint(datapoints_by_token[token].back()));
 
   if (token != n_tokens - 1) {
     datapoints_by_token[token] = std::move(datapoints_by_token[n_tokens - 1]);
@@ -443,6 +517,7 @@ Status TreeXHybridMutator<Searcher>::RemoveCentroid(int32_t token) {
         std::move(searcher_->leaf_searchers_[n_tokens - 1]);
     leaf_mutators_[token] = std::move(leaf_mutators_[n_tokens - 1]);
     mutation_stats_[token] = mutation_stats_[n_tokens - 1];
+    stats_collector().SwapPartitions(token, n_tokens - 1);
 
     if (std::holds_alternative<GlobalToLocal1>(global_to_local_)) {
       auto& global_to_local = std::get<GlobalToLocal1>(global_to_local_);
@@ -455,11 +530,12 @@ Status TreeXHybridMutator<Searcher>::RemoveCentroid(int32_t token) {
     }
   }
 
-  TF_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
+  SCANN_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
   searcher_->datapoints_by_token_.pop_back();
   searcher_->leaf_searchers_.pop_back();
   mutation_stats_.pop_back();
   leaf_mutators_.pop_back();
+  stats_collector().RemoveLastPartition();
   return mutator->RemoveDatapoint(token);
 }
 
@@ -477,20 +553,23 @@ Status TreeXHybridMutator<Searcher>::ShrinkPartition(int32_t token) {
   VLOG(3) << "Shrink " << token << " / " << n_tokens
           << " Size = " << datapoints_by_token[token].size();
 
+  stats_collector().SubtractPartition(token);
+  if (incremental_opts_ && incremental_opts_->enable_health_stats_collection_)
+    updated_token_centroid_ = token;
+
   vector<float> res(centroid_->LeafCenters()[0].dimensionality(),
                     numeric_limits<int32_t>::max());
-  SCANN_RETURN_IF_ERROR(UpdateCentroid(MakeDatapointPtr(res), token));
+  SCANN_RETURN_IF_ERROR(UpdateCentroid(MakeDatapointPtr(res), token, false));
 
-  reassignment_in_flight_ = true;
-  SCANN_RETURN_IF_ERROR(Reassign(token));
-  reassignment_in_flight_ = false;
+  SCANN_RETURN_IF_ERROR(Reassign(token, {.reassignment_in_flight = true}));
+  updated_token_centroid_ = kInvalidToken;
 
   if (reassignment_set_.contains(n_tokens - 1)) {
     reassignment_set_.erase(n_tokens - 1);
     reassignment_set_.insert(token);
   }
 
-  return RemoveCentroid(token);
+  return RemoveEmptyCentroid(token);
 }
 
 template <typename Searcher>
@@ -515,18 +594,18 @@ Status TreeXHybridMutator<Searcher>::SplitPartition(int32_t token) {
   const float kEpsilon = 1e-6;
   DatapointPtr<T> perturb =
       GetDatapointPtr(datapoints_by_token[token][0], &storage, true);
-  auto norm = SquaredL2Norm(perturb) + kEpsilon;
+  auto norm = std::sqrt(SquaredL2Norm(perturb)) + kEpsilon;
   for (int d : Seq(centroid.dimensionality()))
     centroid.mutable_values_span()[d] +=
         kEpsilon * perturb.values_span()[d] / norm;
   SCANN_RETURN_IF_ERROR(AddCentroid(centroid.ToPtr()));
 
-  reassignment_in_flight_ = true;
-  if (incremental_opts_->max_split_ >= n_tokens)
-    SCANN_RETURN_IF_ERROR(Reassign(token));
-  else
-    SCANN_RETURN_IF_ERROR(ReassignTopK(token, incremental_opts_->max_split_));
-  reassignment_in_flight_ = false;
+  if (incremental_opts_->max_split_ >= n_tokens) {
+    SCANN_RETURN_IF_ERROR(Reassign(token, {.reassignment_in_flight = true}));
+  } else {
+    SCANN_RETURN_IF_ERROR(ReassignTopK(token, incremental_opts_->max_split_,
+                                       {.reassignment_in_flight = true}));
+  }
 
   reassignment_set_.erase(token);
 
@@ -541,19 +620,40 @@ Status TreeXHybridMutator<Searcher>::SplitPartition(int32_t token) {
 
 template <typename Searcher>
 Status TreeXHybridMutator<Searcher>::UpdateCentroid(DatapointPtr<float> x,
-                                                    int32_t token) {
+                                                    int32_t token,
+                                                    bool stats_update) {
+  Datapoint<float> old_centroid;
+  if (stats_update) {
+    CopyToDatapoint(centroid_->LeafCenters()[token], &old_centroid);
+  }
+
   SCANN_RET_CHECK_NE(nullptr, centroid_)
       << "Incremental training must be enabled for AddCentroid.";
   SCANN_RET_CHECK_LT(token, searcher_->datapoints_by_token_.size())
       << "Incorrect token number: " << token;
 
-  TF_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
-  return mutator->UpdateDatapoint(x, token);
+  SCANN_ASSIGN_OR_RETURN(auto mutator, centroid_->LeafCenters().GetMutator());
+  SCANN_RETURN_IF_ERROR(mutator->UpdateDatapoint(x, token));
+
+  if (stats_update) {
+    stats_collector().UpdatePartitionCentroid(token, x, old_centroid.ToPtr());
+  }
+
+  return OkStatus();
 }
 
 template <typename Searcher>
-void TreeXHybridMutator<Searcher>::CheckReassignment(int32_t token) {
-  if (reassignment_in_flight_) return;
+Status TreeXHybridMutator<Searcher>::UpdateCentroid(DatapointPtr<float> x,
+                                                    int32_t token) {
+  return UpdateCentroid(x, token, true);
+}
+
+template <typename Searcher>
+void TreeXHybridMutator<Searcher>::CheckReassignment(
+    int32_t token, const MutationOptions& mo) {
+  if (mo.reassignment_in_flight) {
+    return;
+  }
 
   if (token != kInvalidToken) mutation_stats_[token]++;
 
@@ -579,9 +679,9 @@ TreeXHybridMutator<Searcher>::IncrementalMaintenance() {
     auto shared_dataset = searcher_->shared_dataset()
                               ? searcher_->shared_dataset()
                               : searcher_->reordering_helper().dataset();
-    TF_ASSIGN_OR_RETURN(auto config,
-                        Autopilot(searcher_->config().value(), shared_dataset,
-                                  kInvalidDatapointIndex, kInvalidDimension));
+    SCANN_ASSIGN_OR_RETURN(
+        auto config, Autopilot(searcher_->config().value(), shared_dataset,
+                               kInvalidDatapointIndex, kInvalidDimension));
 
     if (!config.has_partitioning()) return config;
 
@@ -599,17 +699,16 @@ TreeXHybridMutator<Searcher>::IncrementalMaintenance() {
     }
   }
 
-  reassignment_in_flight_ = true;
   vector<int32_t> tokens(reassignment_set_.begin(), reassignment_set_.end());
-  SCANN_RETURN_IF_ERROR(Reassign(tokens));
-  reassignment_in_flight_ = false;
+  SCANN_RETURN_IF_ERROR(Reassign(tokens, {.reassignment_in_flight = true}));
 
   reassignment_set_.clear();
   return std::nullopt;
 }
 
 template <typename Searcher>
-Status TreeXHybridMutator<Searcher>::Reassign(ConstSpan<int32_t> tokens) {
+Status TreeXHybridMutator<Searcher>::Reassign(ConstSpan<int32_t> tokens,
+                                              const MutationOptions& mo) {
   vector<DatapointIndex> dptr_idx;
   DenseDataset<T> ds;
   Datapoint<T> dp;
@@ -628,9 +727,10 @@ Status TreeXHybridMutator<Searcher>::Reassign(ConstSpan<int32_t> tokens) {
     auto precomputed = this->ComputePrecomputedMutationArtifacts(
         ds, this->mutation_threadpool());
     for (const auto& [i, idx] : Enumerate(dptr_idx)) {
-      auto mo = MutationOptions{.precomputed_mutation_artifacts =
-                                    precomputed[i].get()};
-      SCANN_RETURN_IF_ERROR(this->UpdateDatapoint(ds[i], idx, mo).status());
+      auto update_mo = mo;
+      update_mo.precomputed_mutation_artifacts = precomputed[i].get();
+      SCANN_RETURN_IF_ERROR(
+          this->UpdateDatapoint(ds[i], idx, update_mo).status());
     }
   }
   return OkStatus();
@@ -638,7 +738,8 @@ Status TreeXHybridMutator<Searcher>::Reassign(ConstSpan<int32_t> tokens) {
 
 template <typename Searcher>
 Status TreeXHybridMutator<Searcher>::ReassignTopK(int32_t token,
-                                                  int32_t max_split) {
+                                                  int32_t max_split,
+                                                  const MutationOptions& mo) {
   auto n_tokens = searcher_->datapoints_by_token_.size();
   vector<uint32_t> perm;
 
@@ -653,8 +754,8 @@ Status TreeXHybridMutator<Searcher>::ReassignTopK(int32_t token,
     Datapoint<T> dp;
     for (DatapointIndex i : dptr_idx)
       SCANN_RETURN_IF_ERROR(ds.Append(GetDatapointPtr(i, &dp), ""));
-    TF_ASSIGN_OR_RETURN(auto tokenization_result,
-                        searcher_->TokenizeAndMaybeResidualize(ds));
+    SCANN_ASSIGN_OR_RETURN(auto tokenization_result,
+                           searcher_->TokenizeAndMaybeResidualize(ds));
     vector<DatapointIndex> count(n_tokens);
     for (const auto& token_res : tokenization_result)
       for (const auto& token : token_res.tokens) count[token]++;
@@ -672,14 +773,23 @@ Status TreeXHybridMutator<Searcher>::ReassignTopK(int32_t token,
   vector<float> res(orig_centroid[0].dimensionality(),
                     std::numeric_limits<int32_t>::max());
   for (DatapointIndex i : Seq(n_tokens))
-    SCANN_RETURN_IF_ERROR(UpdateCentroid(MakeDatapointPtr(res), i));
+    SCANN_RETURN_IF_ERROR(UpdateCentroid(MakeDatapointPtr(res), i, false));
   for (DatapointIndex i : Seq(max_split))
-    SCANN_RETURN_IF_ERROR(UpdateCentroid(orig_centroid[perm[i]], perm[i]));
+    SCANN_RETURN_IF_ERROR(
+        UpdateCentroid(orig_centroid[perm[i]], perm[i], false));
 
-  SCANN_RETURN_IF_ERROR(Reassign(token));
+  SCANN_RETURN_IF_ERROR(Reassign(token, mo));
 
-  for (DatapointIndex i : Seq(n_tokens))
-    SCANN_RETURN_IF_ERROR(UpdateCentroid(orig_centroid[i], i));
+  const DenseDataset<float>& centroid = centroid_->LeafCenters();
+  for (DatapointIndex i : Seq(max_split)) {
+    auto to = orig_centroid.mutable_data(perm[i]);
+    auto from = centroid[perm[i]].values_span();
+    std::memcpy(to.data(), from.data(), from.size() * sizeof(float));
+  }
+
+  for (DatapointIndex i : Seq(n_tokens)) {
+    SCANN_RETURN_IF_ERROR(UpdateCentroid(orig_centroid[i], i, false));
+  }
   return OkStatus();
 }
 
@@ -689,7 +799,7 @@ TreeXHybridMutator<Searcher>::Create(Searcher* searcher) {
   vector<typename SingleMachineSearcherBase<T>::Mutator*> leaf_mutators;
   auto leaf_searchers = MakeMutableSpan(searcher->leaf_searchers_);
   for (int i = 0; i < searcher->leaf_searchers_.size(); ++i) {
-    TF_ASSIGN_OR_RETURN(auto leaf_mutator, leaf_searchers[i]->GetMutator());
+    SCANN_ASSIGN_OR_RETURN(auto leaf_mutator, leaf_searchers[i]->GetMutator());
     leaf_mutators.push_back(leaf_mutator);
   }
 
@@ -804,7 +914,7 @@ TreeXHybridMutator<Searcher>::ComputePrecomputedMutationArtifacts(
         DenseDataset<T> batch;
 
         for (size_t j : Seq(size))
-          TF_CHECK_OK(batch.Append(MakeDatapointPtr(
+          QCHECK_OK(batch.Append(MakeDatapointPtr(
               ds[begin + j].values(), ds[begin + j].dimensionality())));
         auto batch_res = this->ComputePrecomputedMutationArtifacts(batch);
         for (size_t j : Seq(size))
@@ -816,6 +926,7 @@ TreeXHybridMutator<Searcher>::ComputePrecomputedMutationArtifacts(
 template <typename Searcher>
 StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::AddDatapoint(
     const DatapointPtr<T>& dptr, string_view docid, const MutationOptions& mo) {
+  SCANN_RETURN_IF_ERROR(this->ValidateForAdd(dptr, docid, mo));
   DCHECK(searcher_);
   PrecomputedMutationArtifacts* ma = mo.precomputed_mutation_artifacts;
   unique_ptr<PrecomputedMutationArtifacts> ma_storage;
@@ -842,7 +953,7 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::AddDatapoint(
     const TreeXPrecomputedMutationArtifacts& ma, const MutationOptions& mo) {
   int32_t token_add = kInvalidToken;
   auto& global_to_local = std::get<GlobalToLocal>(global_to_local_);
-  TF_ASSIGN_OR_RETURN(
+  SCANN_ASSIGN_OR_RETURN(
       const DatapointIndex add_to_base_result,
       this->AddDatapointToBase(dptr, docid, MutateBaseOptions{}));
   if (add_to_base_result != kInvalidDatapointIndex) {
@@ -861,7 +972,7 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::AddDatapoint(
   size_t cur_global_to_local_idx = 0;
 
   for (auto [token_idx, token] : Enumerate(tokens)) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         const DatapointIndex local_dp_idx,
         leaf_mutators_[token]->AddDatapoint(
             ma.GetMaybeResidual(dptr, token_idx), "",
@@ -882,8 +993,9 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::AddDatapoint(
 
   if (!mutation_stats_.empty() && token_add != kInvalidToken) {
     SCANN_RETURN_IF_ERROR(IngestUpdate(token_add, dptr, 1));
-    CheckReassignment(token_add);
+    CheckReassignment(token_add, mo);
   }
+  stats_collector().AddStats(tokens, {add_to_base_result});
   ++searcher_->num_datapoints_;
   return searcher_->num_datapoints_ - 1;
 }
@@ -912,6 +1024,7 @@ template <typename Searcher>
 StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::UpdateDatapoint(
     const DatapointPtr<T>& dptr, DatapointIndex index,
     const MutationOptions& mo) {
+  SCANN_RETURN_IF_ERROR(this->ValidateForUpdate(dptr, index, mo));
   DCHECK(searcher_);
   const bool mutate_values = true;
   vector<int32_t> tokens_storage;
@@ -943,6 +1056,13 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::UpdateDatapoint(
   SCANN_RET_CHECK(mutate_values_vector);
 
   auto& global_to_local = std::get<GlobalToLocal>(global_to_local_);
+  if (updated_token_centroid_ == kInvalidToken) {
+    std::vector<int32_t> tmp_tokens;
+    auto& g2l = global_to_local[dp_idx];
+    tmp_tokens.reserve(g2l.size());
+    for (auto [token, sub_index] : g2l) tmp_tokens.push_back(token);
+    stats_collector().SubtractStats(tmp_tokens, {dp_idx});
+  }
 
   Datapoint<T> orig;
   int32_t token_remove = kInvalidToken, token_add = kInvalidToken;
@@ -984,11 +1104,12 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::UpdateDatapoint(
                                       leaf_precomputed_artifacts.get(),
                               })
             .status());
-    new_global_to_local[new_global_to_local_idx++] = {token, sub_index1};
-    token = -1;
-    old_global_to_local.erase(it);
 
     if (token_add == kInvalidToken) token_add = token_remove = token;
+
+    new_global_to_local[new_global_to_local_idx++] = {token, sub_index1};
+    token = kInvalidToken;
+    old_global_to_local.erase(it);
   }
 
   for (auto [token1, sub_index1] : old_global_to_local) {
@@ -1007,11 +1128,11 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::UpdateDatapoint(
   }
 
   for (auto [token_idx, token] : Enumerate(tokens)) {
-    if (token == -1) continue;
+    if (token == kInvalidToken) continue;
     const DatapointPtr<T> maybe_residualized =
         ma.GetMaybeResidual(dptr, token_idx);
     auto& leaf_precomputed_artifacts = ma.leaf_precomputed_artifacts[token_idx];
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         const DatapointIndex local_dp_idx,
         leaf_mutators_[token]->AddDatapoint(
             maybe_residualized, "",
@@ -1028,10 +1149,14 @@ StatusOr<DatapointIndex> TreeXHybridMutator<Searcher>::UpdateDatapoint(
 
   if (!mutation_stats_.empty() && token_add != kInvalidToken) {
     SCANN_RETURN_IF_ERROR(IngestUpdate(token_add, dptr, 1));
-    CheckReassignment(token_add);
-    SCANN_RETURN_IF_ERROR(IngestUpdate(token_remove, orig.ToPtr(), -1));
-    CheckReassignment(token_remove);
+    CheckReassignment(token_add, mo);
+
+    if (token_remove != updated_token_centroid_) {
+      SCANN_RETURN_IF_ERROR(IngestUpdate(token_remove, orig.ToPtr(), -1));
+      CheckReassignment(token_remove, mo);
+    }
   }
+  stats_collector().AddStats(ma.tokens, {dp_idx});
   SCANN_RET_CHECK_LE(new_global_to_local_idx, new_global_to_local.size());
   return dp_idx;
 }
@@ -1048,6 +1173,7 @@ Status TreeXHybridMutator<Searcher>::RemoveDatapoint(string_view docid) {
 
 template <typename Searcher>
 Status TreeXHybridMutator<Searcher>::RemoveDatapoint(DatapointIndex dp_idx) {
+  SCANN_RETURN_IF_ERROR(this->ValidateForRemove(dp_idx));
   return SCANN_DISPATCH_ON_GLOBAL_TO_LOCAL(RemoveDatapointImpl, dp_idx);
 }
 
@@ -1065,6 +1191,12 @@ Status TreeXHybridMutator<Searcher>::RemoveDatapointImpl(
   Datapoint<T> orig;
   int32_t token_remove = kInvalidToken;
   if (!mutation_stats_.empty()) GetDatapointPtr(dp_idx, &orig, true);
+
+  std::vector<int32_t> tmp_tokens;
+  auto& g2l = global_to_local[dp_idx];
+  tmp_tokens.reserve(g2l.size());
+  for (auto [token, sub_index] : g2l) tmp_tokens.push_back(token);
+  stats_collector().SubtractStats(tmp_tokens, {dp_idx});
 
   SCANN_RETURN_IF_ERROR(this->RemoveDatapointFromBase(dp_idx).status());
 

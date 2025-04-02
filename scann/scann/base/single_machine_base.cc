@@ -21,28 +21,33 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <typeinfo>
 #include <utility>
 
+#include "absl/base/nullability.h"
+#include "absl/base/prefetch.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/match.h"
 #include "absl/strings/substitute.h"
 #include "scann/base/search_parameters.h"
 #include "scann/base/single_machine_factory_options.h"
+#include "scann/brute_force/brute_force.h"
 #include "scann/data_format/datapoint.h"
 #include "scann/data_format/docid_collection_interface.h"
+#include "scann/distance_measures/distance_measure_factory.h"
 #include "scann/metadata/metadata_getter.h"
 #include "scann/oss_wrappers/scann_status.h"
 #include "scann/proto/results.pb.h"
 #include "scann/utils/common.h"
 #include "scann/utils/factory_helpers.h"
 #include "scann/utils/fast_top_neighbors.h"
+#include "scann/utils/multi_stage_batch_pipeline.h"
 #include "scann/utils/types.h"
 #include "scann/utils/util_functions.h"
 #include "scann/utils/zip_sort.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
@@ -57,6 +62,13 @@ StatusOr<string_view> UntypedSingleMachineSearcherBase::GetDocid(
   }
 
   const size_t n_docids = docids_->size();
+  const Dataset* dataset = this->dataset();
+  if (dataset) {
+    SCANN_RET_CHECK_EQ(n_docids, dataset->size())
+        << "Dataset size and docids size have diverged.  (Datapoint index "
+           "requested to GetDocid = "
+        << i << ")  This likely indicates an internal error in ScaNN.";
+  }
   if (i >= n_docids) {
     return InvalidArgumentError("Datapoint index (%d) is >= dataset size (%d).",
                                 i, n_docids);
@@ -172,7 +184,7 @@ SingleMachineSearcherBase<T>::SingleMachineSearcherBase(
                                        default_pre_reordering_num_neighbors,
                                        default_pre_reordering_epsilon),
       dataset_(dataset) {
-  TF_CHECK_OK(BaseInitImpl());
+  CHECK_OK(BaseInitImpl());
 }
 
 template <typename T>
@@ -298,7 +310,7 @@ SingleMachineSearcherBase<T>::SharedFloatDatasetIfNeeded() {
 template <typename T>
 StatusOr<shared_ptr<const DenseDataset<float>>>
 SingleMachineSearcherBase<T>::ReconstructFloatDataset() {
-  TF_ASSIGN_OR_RETURN(auto dataset, SharedFloatDatasetIfNeeded());
+  SCANN_ASSIGN_OR_RETURN(auto dataset, SharedFloatDatasetIfNeeded());
   if (dataset != nullptr) {
     return dataset;
   } else if (reordering_enabled()) {
@@ -348,13 +360,28 @@ Status SingleMachineSearcherBase<T>::FindNeighborsNoSortNoExactReorder(
         "Crowding is enabled for query but not enabled in searcher.");
   }
 
-  if (dataset() && !dataset()->empty() &&
-      query.dimensionality() != dataset()->dimensionality()) {
+  std::optional<DimensionIndex> db_dim;
+  if (dataset() && !dataset()->empty()) {
+    db_dim = dataset()->dimensionality();
+  } else if (reordering_helper_) {
+    auto dataset = reordering_helper_->dataset();
+    if (dataset && !dataset->empty()) db_dim = dataset->dimensionality();
+  }
+  if (db_dim && *db_dim != query.dimensionality()) {
     return FailedPreconditionError(
-        StrFormat("Query dimensionality (%u) does not match database "
-                  "dimensionality (%u)",
-                  static_cast<uint64_t>(query.dimensionality()),
-                  static_cast<uint64_t>(dataset()->dimensionality())));
+        StrFormat("Query dimensionality (%d) does not match database "
+                  "dimensionality (%d)",
+                  query.dimensionality(), *db_dim));
+  }
+  if (params.restrict_whitelist() && docids_ &&
+      params.restrict_whitelist()->size() > docids_->size()) {
+    const std::string dataset_size =
+        (dataset()) ? StrCat(dataset()->size()) : "unknown";
+    return OutOfRangeError(
+        "The number of datapoints in the restrict allowlist (%d) is greater "
+        "than the number of docids in the dataset (%d).  Dataset object size = "
+        "%s.",
+        params.restrict_whitelist()->size(), docids_->size(), dataset_size);
   }
 
   return FindNeighborsImpl(query, params, result);
@@ -422,6 +449,16 @@ Status SingleMachineSearcherBase<T>::ValidateFindNeighborsBatched(
                            "enabled in searcher.",
                            query_idx));
     }
+    if (param.restrict_whitelist() && docids_ &&
+        param.restrict_whitelist()->size() > docids_->size()) {
+      const std::string dataset_size =
+          (dataset()) ? StrCat(dataset()->size()) : "unknown";
+      return OutOfRangeError(
+          "The number of datapoints in the restrict allowlist (%d) is greater "
+          "than the number of docids in the dataset (%d).  Dataset object size "
+          "= %s.",
+          param.restrict_whitelist()->size(), docids_->size(), dataset_size);
+    }
   }
 
   bool reordering_enabled = exact_reordering_enabled();
@@ -461,6 +498,7 @@ Status SingleMachineSearcherBase<T>::GetNeighborProto(
     pair<DatapointIndex, float> neighbor, const DatapointPtr<T>& query,
     NearestNeighbors::Neighbor* result) const {
   SCANN_RETURN_IF_ERROR(GetNeighborProtoNoMetadata(neighbor, query, result));
+
   if (!metadata_enabled()) return OkStatus();
 
   Status status = metadata_getter()->GetMetadata(
@@ -475,7 +513,7 @@ Status SingleMachineSearcherBase<T>::GetNeighborProtoNoMetadata(
     NearestNeighbors::Neighbor* result) const {
   DCHECK(result);
   result->Clear();
-  TF_ASSIGN_OR_RETURN(auto docid, GetDocid(neighbor.first));
+  SCANN_ASSIGN_OR_RETURN(auto docid, GetDocid(neighbor.first));
   result->set_docid(std::string(docid));
   result->set_distance(neighbor.second);
   if (crowding_enabled()) {
@@ -585,11 +623,48 @@ Status SingleMachineSearcherBase<T>::FindNeighborsBatchedImpl(
 }
 
 template <typename T>
+StatusOr<const SingleMachineSearcherBase<T>*>
+SingleMachineSearcherBase<T>::CreateBruteForceSearcher(
+    const DistanceMeasureConfig& distance_config,
+    unique_ptr<SingleMachineSearcherBase<T>>* storage) const {
+  SCANN_RET_CHECK(storage);
+  SingleMachineSearcherBase<T>* result = nullptr;
+  if (dataset()) {
+    SCANN_ASSIGN_OR_RETURN(auto dist, GetDistanceMeasure(distance_config));
+    SCANN_RET_CHECK(storage);
+    storage->reset(new BruteForceSearcher<T>(
+        std::move(dist), dataset_, default_post_reordering_num_neighbors(),
+        default_post_reordering_epsilon()));
+    result = storage->get();
+  } else if (reordering_helper_) {
+    SCANN_RET_CHECK(storage);
+    SCANN_ASSIGN_OR_RETURN(*storage,
+                           reordering_helper_->CreateBruteForceSearcher(
+                               default_post_reordering_num_neighbors(),
+                               default_post_reordering_epsilon()));
+    result = storage->get();
+    return result;
+  }
+
+  if (!result) {
+    return FailedPreconditionError(
+        "Cannot create brute force searcher from a non-brute force searcher "
+        "without reordering enabled.");
+  }
+  result->docids_ = docids_;
+  result->metadata_getter_ = metadata_getter_;
+  result->datapoint_index_to_crowding_attribute_ =
+      datapoint_index_to_crowding_attribute_;
+  result->creation_timestamp_ = creation_timestamp_;
+  return result;
+}
+
+template <typename T>
 Status SingleMachineSearcherBase<T>::ReorderResults(
     const DatapointPtr<T>& query, const SearchParameters& params,
     NNResultsVector* result) const {
   if (params.post_reordering_num_neighbors() == 1) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         auto top1,
         reordering_helper_->ComputeTop1ReorderingDistance(query, result));
     if (!result->empty() && top1.second < params.post_reordering_epsilon() &&
