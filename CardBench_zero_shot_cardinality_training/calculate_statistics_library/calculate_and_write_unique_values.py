@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,7 +79,8 @@ def calculate_and_write_unique_values_internal(
       print(traceback.format_exc())
     unique_vals = []
     for row in queryjob:
-      unique_vals.append(row["val"])
+      if row["val"] is not None:
+        unique_vals.append(row["val"])
 
     extra_stats_table_sql_string = get_sql_table_string(
         dbs["metadata_dbtype"], extra_stats_table

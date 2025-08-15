@@ -1,4 +1,4 @@
-// Copyright 2024 The Google Research Authors.
+// Copyright 2025 The Google Research Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -132,7 +132,7 @@ class AntheaDocSys {
    * array.
    *
    * Both source-segment and target-segment can together
-   * be empty (but not just one of the two), indicating a paragraph break.
+   * be empty to indicate a paragraph break.
    * For convenience, a completely blank line (without the tabs
    * and without document-name and system-name) can also be used to indicate
    * a paragraph break.
@@ -184,7 +184,8 @@ class AntheaDocSys {
     let docsys = new AntheaDocSys();
     const unescaper = (s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
     for (let line of lines.slice(1)) {
-      line = line.trim();
+      // Remove leading and trailing non-tab whitespace.
+      line = line.replace(/^[^\S\t]+|[^\S\t]+$/g, '');
       const parts = line.split('\t', 5);
       if (!line || parts.length == 2) {
         /** The line may be blank or may have just doc+sys */
@@ -222,7 +223,7 @@ class AntheaDocSys {
       docsys.srcSegments.push(srcSegment);
       docsys.tgtSegments.push(tgtSegment);
       docsys.annotations.push(annotation);
-      if (srcSegment) {
+      if (srcSegment || tgtSegment) {
         docsys.numNonBlankSegments++;
       }
     }
@@ -363,7 +364,7 @@ class AntheaCursor {
   }
 
   /**
-   * Returns true if the passed segment has been full seen.
+   * Returns true if the passed segment has been fully seen.
    * @param {number} seg
    * @return {boolean}
    */
@@ -562,8 +563,17 @@ class AntheaCursor {
             );
       }
     }
-    /* Check completion of a segment seg on a side s. */
-    let sideDone = (s) => this.numSubparasShown[s][seg] === this.numSubparas[s][seg];
+    this.maybeMarkSegmentDone(seg);
+  }
+
+  /**
+   * If all subparas on all sides have been shown for the specified segment,
+   * then mark the segment as done.
+   * @param {number} seg
+   */
+  maybeMarkSegmentDone(seg) {
+    const sideDone = (s) =>
+        this.numSubparasShown[s][seg] === this.numSubparas[s][seg];
     if (this.sideOrder.every((s) => sideDone(s))) {
       this.segmentDone_(seg);
     }
@@ -1052,6 +1062,10 @@ class AntheaEval {
           // Change the doc value based on the side which matters for Marot's
           // error result parsing.
           evalResultCopy.doc = evalResults[s].doc * 2 + j;
+          // Save the single quality score corresponding to this result.
+          if (this.config.COLLECT_QUALITY_SCORE) {
+            evalResultCopy.quality_scores = [evalResults[s].quality_scores[j]];
+          }
           splitEvalResults.push(evalResultCopy);
         }
       }
@@ -1167,7 +1181,7 @@ class AntheaEval {
     const docEvalCell = this.docs_[this.cursor.doc].eval;
     docEvalCell.appendChild(this.evalPanel_);
     this.displayedProgress_.innerHTML = this.getPercentEvaluated();
-    this.showPageContextIfPresent();
+    this.showContextAndMediaIfPresent();
     this.redrawAllSegments();
     this.recomputeTops();
     this.refreshCurrSubpara();
@@ -1230,6 +1244,12 @@ class AntheaEval {
         this.addLocationToHotw(splitTwo, "translation2");
         splitOne.hotw_list.push(...splitTwo.hotw_list);
 
+        if (this.config.COLLECT_QUALITY_SCORE) {
+          splitOne.quality_scores = [
+            splitOne.quality_scores[0],
+            splitTwo.quality_scores[0]
+          ];
+        }
         mergedEvalResults.push(splitOne);
       }
     }
@@ -1645,6 +1665,42 @@ class AntheaEval {
   }
 
   /**
+   * Resets the quality score and display for the current segment.
+   */
+  resetQualityScore() {
+    if (this.config.COLLECT_QUALITY_SCORE) {
+      this.currSegmentEval().quality_scores[this.cursor.side - 1] = -1;
+      this.undoProgressForCurrentSegment();
+      this.updateQualityScoreDisplay();
+    }
+  }
+
+  /**
+   * Updates the quality score slider display based on the current segment.
+   */
+  updateQualityScoreDisplay() {
+    if (this.config.COLLECT_QUALITY_SCORE) {
+      if (this.cursor.side === 0) {
+        this.qualityScorePanel_.style.display = 'none';
+      } else {
+        this.qualityScorePanel_.style.display = '';
+        const qualityScore = this.currSegmentEval().quality_scores[this.cursor.side - 1];
+        if (qualityScore >= 0) {
+          this.qualityScoreSlider_.value = qualityScore;
+          this.qualityScoreSlider_.style.setProperty('--slider-thumb-color',
+              'var(--slider-set-thumb-color)');
+          this.qualityScoreText_.innerHTML = qualityScore;
+        } else {
+          this.qualityScoreSlider_.value = 50;
+          this.qualityScoreSlider_.style.setProperty('--slider-thumb-color',
+              'var(--slider-unset-thumb-color)');
+          this.qualityScoreText_.innerHTML = 'Unset';
+        }
+      }
+    }
+  }
+
+  /**
    * Shows the subpara at index (seg, side, para). How the subpara gets shown
    *     depends on whether it is before, at, or after this.cursor.
    * @param {number} seg
@@ -1704,6 +1760,7 @@ class AntheaEval {
     }
 
     if (isCurr) {
+      this.updateQualityScoreDisplay();
       subpara.subparaSpan.classList.remove('anthea-fading-text');
       this.evalPanel_.style.top = subpara.top;
       this.evalPanelErrors_.innerHTML = '';
@@ -2078,9 +2135,30 @@ class AntheaEval {
     if (this.evalResults_[seg].visited) {
       return;
     }
+    if (this.config.COLLECT_QUALITY_SCORE &&
+        this.evalResults_[seg].quality_scores.some(value => value === -1)) {
+      return;
+    }
     this.evalResults_[seg].visited = true;
     this.saveResults();
     this.numWordsEvaluated_ += this.segments_[seg].numTgtWords;
+    if (this.displayedProgress_) {
+      this.displayedProgress_.innerHTML = this.getPercentEvaluated();
+    }
+  }
+
+  /**
+   * Undoes the progress update for the current segment. This can happen if the
+   * quality score gets reset because of a HOTW error.
+   */
+  undoProgressForCurrentSegment() {
+    const seg = this.cursor.seg;
+    if (!this.evalResults_[seg].visited) {
+      return;
+    }
+    this.evalResults_[seg].visited = false;
+    this.saveResults();
+    this.numWordsEvaluated_ -= this.segments_[seg].numTgtWords;
     if (this.displayedProgress_) {
       this.displayedProgress_.innerHTML = this.getPercentEvaluated();
     }
@@ -2096,6 +2174,7 @@ class AntheaEval {
   finishCurrSubpara() {
     const subpara = this.getCurrSubpara();
     if (!this.READ_ONLY && subpara.hotw && !subpara.hotw.done) {
+      this.resetQualityScore();
       const evalResult = this.currSegmentEval();
       this.noteTiming('missed-hands-on-the-wheel-error');
       subpara.hotw.done = true;
@@ -2291,6 +2370,39 @@ class AntheaEval {
     this.guidance_ = googdom.createDom('div', 'anthea-eval-guidance');
     this.guidancePanel_.appendChild(this.guidance_);
 
+    if (this.config.COLLECT_QUALITY_SCORE) {
+      this.qualityScoreSlider_ = googdom.createDom('input', {
+        'class': 'anthea-slider',
+        'type': 'range',
+        'min': 0,
+        'max': 100,
+        'value': 50,
+        'onkeydown': 'return false;' // Prevent arrow keys from affecting score.
+      });
+      this.qualityScoreText_ =
+          googdom.createDom('div', 'anthea-quality-score-text', 'Unset');
+      this.qualityScorePanel_ = googdom.createDom(
+          'div', 'anthea-quality-score-panel',
+          'Quality Score: ', this.qualityScoreText_, this.qualityScoreSlider_);
+      const qualityScoreLandmarks = [
+        '0: No meaning preserved', '33: Some meaning preserved',
+        '66: Most meaning preserved, few grammar mistakes',
+        '100: Perfect meaning/grammar'
+      ];
+      qualityScoreLandmarks.forEach(
+          landmark => this.qualityScorePanel_.appendChild(googdom.createDom(
+              'div', 'anthea-quality-score-landmark', landmark)));
+
+      this.guidancePanel_.appendChild(this.qualityScorePanel_);
+      const qualityScoreListener = (e) => {
+        this.currSegmentEval().quality_scores[this.cursor.side - 1] =
+            Number(this.qualityScoreSlider_.value);
+        this.updateQualityScoreDisplay();
+        this.cursor.maybeMarkSegmentDone(this.cursor.seg);
+      };
+      this.qualityScoreSlider_.addEventListener('input', qualityScoreListener);
+  }
+
     this.cancel_ = googdom.createDom(
         'button', 'anthea-stretchy-button anthea-eval-cancel', 'Cancel (Esc)');
     this.cancel_.style.display = 'none';
@@ -2428,6 +2540,7 @@ class AntheaEval {
   setMQMSpan(start, end, prefix, selected) {
     const subpara = this.getCurrSubpara();
     if (subpara.hotw && !subpara.hotw.done) {
+      this.resetQualityScore();
       const evalResult = this.currSegmentEval();
       this.noteTiming('found-hands-on-the-wheel-error');
       subpara.hotw.done = true;
@@ -2892,7 +3005,7 @@ class AntheaEval {
     this.docs_[this.cursor.doc].row.style.display = '';
     const docEvalCell = this.docs_[this.cursor.doc].eval;
     docEvalCell.appendChild(this.evalPanel_);
-    this.showPageContextIfPresent();
+    this.showContextAndMediaIfPresent();
     this.redrawAllSegments();
     this.recomputeTops();
     this.refreshCurrSubpara();
@@ -2919,7 +3032,7 @@ class AntheaEval {
     this.docs_[this.cursor.doc].row.style.display = '';
     const docEvalCell = this.docs_[this.cursor.doc].eval;
     docEvalCell.appendChild(this.evalPanel_);
-    this.showPageContextIfPresent();
+    this.showContextAndMediaIfPresent();
     this.redrawAllSegments();
     this.recomputeTops();
     this.refreshCurrSubpara();
@@ -3687,6 +3800,43 @@ class AntheaEval {
   }
 
   /**
+   * Extract source media, if provided via an annotation on the first segment.
+   */
+  extractSourceMedia() {
+    this.manager_.log(this.manager_.INFO,
+                      'Extracting source media from annotations');
+    for (let i = 0; i < this.docs_.length; i++) {
+      const thisDoc = this.docs_[i];
+      // Add an empty image as a default, so that page layout is not broken for
+      // documents that don't have any source media.
+      thisDoc.srcMedia = {url: 'data:,', type: 'image'};
+      if (!thisDoc.docsys.annotations ||
+          thisDoc.docsys.annotations.length === 0 ||
+          !thisDoc.docsys.annotations[0]) {
+        this.manager_.log(this.manager_.WARNING,
+                          `No annotation (hence no source media) for doc ${i}`);
+        continue;
+      }
+      try {
+        const annotation = JSON.parse(thisDoc.docsys.annotations[0]);
+        if (!annotation.source_media) {
+          this.manager_.log(
+              this.manager_.ERROR,
+              `Incomplete/missing source media in the annotation for doc ${i}`);
+          continue;
+        }
+        // Overwrite the default source media.
+        thisDoc.srcMedia = annotation.source_media;
+      } catch (err) {
+        this.manager_.log(
+            this.manager_.ERROR,
+            `Unparseable source media in the annotation for doc ${i}`);
+        continue;
+      }
+    }
+  }
+
+  /**
    * Extract page contexts, if provided via an annotation on the first segment.
    */
   extractPageContexts() {
@@ -3718,6 +3868,70 @@ class AntheaEval {
         continue;
       }
     }
+  }
+
+  /**
+   * If the current document uses media as the source instead of text (e.g. a
+   * video), then show it in the source panel.
+   */
+  showSourceMediaIfPresent() {
+    const doc = this.docs_[this.cursor.doc];
+    if (!doc.srcMedia) {
+      return;
+    }
+    if (!["video", "image"].includes(doc.srcMedia.type)) {
+      this.manager_.log(
+          this.manager_.ERROR,
+          `Source media is not a video or image (or type not specified): "${
+              doc.srcMedia.type}"`);
+      return;
+    }
+    const driveRegex = /https:\/\/drive.google.com\/file\/d\/[^\/]+\/preview/;
+    const ytRegex = /https:\/\/www.youtube.com\/embed\/.*/;
+    if (doc.srcMedia.type === 'video' &&
+        ![driveRegex, ytRegex].some((re) => re.test(doc.srcMedia.url))) {
+      this.manager_.log(
+          this.manager_.ERROR,
+          `Source media is a video but not from YouTube or Drive (or is misformatted): ${
+              doc.srcMedia.url}`);
+      return;
+    }
+    const mediaCell = googdom.createDom(
+        'div', 'anthea-source-media-cell');
+    switch (doc.srcMedia.type) {
+      case 'image':
+        mediaCell.appendChild(googdom.createDom(
+          'img', {src: doc.srcMedia.url, title: 'Source media image'}));
+        break;
+      case 'video':
+        mediaCell.appendChild(googdom.createDom('iframe', {
+          src: doc.srcMedia.url,
+          title: 'Source media video',
+          allow: 'autoplay; encrypted-media;',
+          allowfullscreen: true
+        }));
+        break;
+      default:
+        this.manager_.log(
+            this.manager_.ERROR,
+            `Source media is not a video or image (or type not specified): "${
+                doc.srcMedia.type}"`);
+        return;
+    }
+    // The source text cell is the first child of the row. Replace it with the
+    // media cell.
+    doc.row.replaceChild(
+        googdom.createDom('td', null, mediaCell), doc.row.firstChild);
+  }
+
+  /**
+   * If the current document has available page context or source media, then
+   * display them. See showPageContextIfPresent() and showSourceMediaIfPresent()
+   * for more details.
+   */
+  showContextAndMediaIfPresent() {
+    this.showPageContextIfPresent();
+    this.showSourceMediaIfPresent();
   }
 
   /**
@@ -4036,6 +4250,17 @@ class AntheaEval {
   }
 
   /**
+   * Determines whether the source column should be displayed. True if it will
+   * be populated with source text or source media.
+   *
+   * @param {!Object} config The template configuration object.
+   * @return {boolean} True if the source column should be displayed.
+   */
+  shouldDisplaySourceColumn(config) {
+    return !config.TARGET_SIDE_ONLY || config.USE_SOURCE_MEDIA;
+  }
+
+  /**
    * Sets up the eval. This is the starting point called once the template has
    *     been loaded.
    *
@@ -4080,12 +4305,18 @@ class AntheaEval {
     /**
      * By default, raters navigate in units of sentences. If subpara_*
      * parameters have been passed in, they control the unit size.
-     * Also support the old names of these parameters (paralet_*)
+     * Also support the old names of these parameters (paralet_*).
+     *
+     * When collecting quality scores, we want to make it clear that the score
+     * applies to the entire segment, so we set the unit sizes to -1 to indicate
+     * that no splitting should happen.
      */
-    const subparaSentences = parameters.subpara_sentences ?? (
-        parameters.paralet_sentences ?? 1);
-    const subparaTokens = parameters.subpara_tokens ?? (
-        parameters.paralet_tokens ?? 1);
+    if (config.COLLECT_QUALITY_SCORE) {
+      parameters.subpara_sentences = -1;
+      parameters.subpara_tokens = -1;
+    }
+    const subparaSentences = parameters.subpara_sentences ?? (parameters.paralet_sentences ?? 1);
+    const subparaTokens = parameters.subpara_tokens ?? (parameters.paralet_tokens ?? 1);
 
     if (parameters.hasOwnProperty('hotw_percent')) {
       /* Override the passed value */
@@ -4098,7 +4329,8 @@ class AntheaEval {
         this.srcLang ? ('Source (' + this.srcLang + ')') : 'Source';
     const srcHeadingDiv = googdom.createDom('div', null, srcHeading);
 
-    const targetLabel = config.TARGET_SIDE_ONLY ? 'Text' : 'Translation';
+    const targetLabel =
+        this.shouldDisplaySourceColumn(config) ? 'Translation' : 'Text';
     const tgtHeading = this.tgtLang ?
         (targetLabel + ' (' + this.tgtLang + ')') : targetLabel;
     const tgtHeadingDiv = googdom.createDom('div', null, tgtHeading);
@@ -4154,7 +4386,7 @@ class AntheaEval {
         'table', 'anthea-document-text-table',
         headerRow,
         this.contextRow_);
-    if (config.TARGET_SIDE_ONLY) {
+    if (!this.shouldDisplaySourceColumn(config)) {
       srcHeadingTD.style.display = 'none';
     }
     evalDiv.appendChild(docTextTable);
@@ -4204,7 +4436,6 @@ class AntheaEval {
                                               'anthea-document-text-cell');
       const docTextTgtRow2 = config.SIDE_BY_SIDE ? googdom.createDom('td',
                                               'anthea-document-text-cell') : null;
-      doc.row = googdom.createDom('tr', null, docTextSrcRow);
       const tgtsOrder = [1];
       const tgtRows = [docTextTgtRow];
       if (config.SIDE_BY_SIDE) {
@@ -4241,7 +4472,7 @@ class AntheaEval {
       const addEndSpacesSrc = this.isSpaceSepLang(this.srcLang);
       const addEndSpacesTgt = this.isSpaceSepLang(this.tgtLang);
       for (let j = 0; j < srcSegments.length; j++) {
-        if (srcSegments[j].length == 0) {
+        if (srcSegments[j].length === 0 && tgtSegments[j].length === 0) {
           /* New paragraph. */
           srcSpannified += srcParaBreak;
           tgtSpannified += tgtParaBreak;
@@ -4257,6 +4488,10 @@ class AntheaEval {
           'timing': {},
           'hotw_list': [],
         };
+        if (config.COLLECT_QUALITY_SCORE) {
+          evalResult.quality_scores =
+              Array.from({'length': config.SIDE_BY_SIDE ? 2 : 1}).fill(-1);
+        }
         this.evalResults_.push(evalResult);
         if (j < annotations.length) {
           let parsed_anno = {};
@@ -4480,7 +4715,10 @@ class AntheaEval {
     if (config.USE_PAGE_CONTEXT) {
       this.extractPageContexts();
     }
-    this.showPageContextIfPresent();
+    if (config.USE_SOURCE_MEDIA) {
+      this.extractSourceMedia();
+    }
+    this.showContextAndMediaIfPresent();
 
     this.redrawAllSegments();
     this.recomputeTops();

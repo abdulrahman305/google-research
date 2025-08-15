@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ import tensorflow as tf
 
 from imp.max.core import constants
 from imp.max.core import utils
+
+jax.config.update('jax_threefry_partitionable', False)
 
 PROCESS_COUNT = 4
 LOCAL_DEVICE_COUNT = 2

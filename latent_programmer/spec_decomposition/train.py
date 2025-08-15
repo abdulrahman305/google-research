@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -404,9 +404,9 @@ def run_program(program, inputs):
       return [None] * len(inputs)
     initial_states = [deepcoder_dsl.ProgramState.from_str(i) for i in inputs]
     if FLAGS.model_type == 'baseline_model':
-      result_states = [program.run(state.state) for state in initial_states]
+      result_states = [program.run(state.state) for state in initial_states]  # pytype: disable=attribute-error
     else:
-      result_states = [program.run(state) for state in initial_states]
+      result_states = [program.run(state) for state in initial_states]  # pytype: disable=attribute-error
     outputs = [deepcoder_dsl.result_to_str(result_state.get_output())
                if result_state else None
                for result_state in result_states]

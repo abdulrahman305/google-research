@@ -1,4 +1,4 @@
-// Copyright 2024 The Google Research Authors.
+// Copyright 2025 The Google Research Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,12 +41,18 @@ antheaTemplates['MQM'] = {
   /**
    * @const {string} Template version identifier.
    */
-  VERSION: 'v1.00-Feb-13-2023',
+  VERSION: 'v1.00-Mar-24-2025',
 
   /**
    * @const {boolean} Show two translations when set to true.
    */
   SIDE_BY_SIDE: false,
+
+  /**
+   * @const {boolean} Collect per-segment quality scores when set to true. Also
+   *    disables splitting segments into sub-paragraphs.
+   */
+  COLLECT_QUALITY_SCORE: false,
 
   /**
    * @const {boolean} Only rate the target side, i.e., the translated text.

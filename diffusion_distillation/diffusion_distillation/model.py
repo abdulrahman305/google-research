@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -197,6 +197,8 @@ class Model:
     loss_fn = functools.partial(self.loss_fn, next(rng), train, batch)
 
     if train:
+      if state.optimizer is None:
+        raise ValueError('Optimizer is None')
       # Training mode
       (_, metrics), grad = jax.value_and_grad(loss_fn, has_aux=True)(
           state.optimizer.target)

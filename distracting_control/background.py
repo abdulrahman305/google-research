@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -220,6 +220,7 @@ class DistractingBackgroundEnv(control.Environment):
         self._current_img_index = 0
         self._step_direction = abs(self._step_direction)
       # Start moving backwards if we are past the end of the images.
+      assert self._background is not None
       if self._current_img_index >= len(self._background.textures):
         self._current_img_index = len(self._background.textures) - 1
         self._step_direction = -abs(self._step_direction)
